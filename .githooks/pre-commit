@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Blocks a commit that would add private data. Installed with: git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/scripts/check-private.sh" staged

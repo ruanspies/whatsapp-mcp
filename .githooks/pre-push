@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Blocks a push whose commits contain private data, including in commits that later removed it.
+# Installed with: git config core.hooksPath .githooks
+remote="$1"
+zero="0000000000000000000000000000000000000000"
+commits=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ "$local_sha" == "$zero" ]] && continue   # deleting a branch
+  if [[ "$remote_sha" == "$zero" ]]; then
+    range=("$local_sha" --not --remotes="$remote")   # new branch: everything the remote lacks
+  else
+    range=("$remote_sha..$local_sha")
+  fi
+  while IFS= read -r commit; do commits+=("$commit"); done < <(git rev-list "${range[@]}")
+done
+(( ${#commits[@]} == 0 )) && exit 0
+exec "$(git rev-parse --show-toplevel)/scripts/check-private.sh" commits "${commits[@]}"
