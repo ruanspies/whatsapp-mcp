@@ -139,6 +139,16 @@ The bridge exposes a small REST API that the MCP server calls. It is locked down
 
 Messages you receive are text written by other people, and the model reads them. A message can try to instruct the model (prompt injection). Keep the approval prompt for `send_message` switched on in your client, and treat downloaded files as untrusted.
 
+### Keeping private data out of the repository
+
+Your messages, session keys and API token live in `whatsapp-bridge/store/`, which git ignores. As a second line of defence, `scripts/check-private.sh` refuses any commit or push that contains the store, a database, a token or key, or (on a machine with a paired bridge) any real phone number or group ID from your account. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The same check runs on GitHub for every push. If it flags a line wrongly, end that line with `private-check: allow`.
+
 ### Configuration
 
 Set these environment variables for the bridge. Those marked "both" must also be set for the MCP server (in the `env` block of its entry in your client's config).
