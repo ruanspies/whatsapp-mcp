@@ -3,3 +3,5 @@ claude_desktop_config.json
 whatsapp.log
 # Session keys, messages, the API token and downloaded media
 whatsapp-bridge/store/
+# The bridge program built by start-bridge.command
+whatsapp-bridge/bin/
