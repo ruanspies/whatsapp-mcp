@@ -71,6 +71,9 @@ func main() {
 
 	bridge := &Bridge{cfg: cfg, client: client, store: messageStore, logger: logger, token: token}
 
+	// Signalled each time the client finishes logging in
+	connected := make(chan struct{}, 1)
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -105,6 +108,10 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			select {
+			case connected <- struct{}{}:
+			default:
+			}
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out. Stop the bridge, delete %s and start it again to scan a new QR code", sessionDB)
@@ -149,11 +156,13 @@ func main() {
 		}
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
+	// Right after pairing WhatsApp drops the connection and the client reconnects,
+	// so wait for the login to complete rather than for a fixed time
+	select {
+	case <-connected:
+	case <-time.After(60 * time.Second):
 		logger.Errorf("Failed to establish stable connection")
+		client.Disconnect()
 		return
 	}
 

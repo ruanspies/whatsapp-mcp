@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -279,5 +280,96 @@ func TestContactNamesReachChats(t *testing.T) {
 	bridge.handleContactChange(alice)
 	if name, _ := bridge.store.ChatName(alice.String()); name != "Alice Adams" {
 		t.Errorf("push name replaced the address book name: %q", name)
+	}
+}
+
+func TestOnlyTheSenderCanChangeAMessage(t *testing.T) {
+	bridge := newIngestBridge(t)
+	ctx := context.Background()
+	bob := types.NewJID("27820000002", types.DefaultUserServer)
+	myDevice := types.NewADJID(me.User, 0, 3)
+
+	bridge.ingest(ctx, live("ALICE1", familyJID, alice, false, text("from Alice")))
+	bridge.ingest(ctx, live("MINE1", familyJID, myDevice, true, text("from me")))
+
+	protocol := func(kind waE2E.ProtocolMessage_Type, target string, edited *waE2E.Message) *waE2E.Message {
+		return &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: kind.Enum(), Key: &waCommon.MessageKey{ID: proto.String(target)}, EditedMessage: edited}}
+	}
+
+	// Bob tries to rewrite, delete and overwrite messages that are not his
+	for _, target := range []string{"ALICE1", "MINE1"} {
+		bridge.ingest(ctx, live("X1"+target, familyJID, bob, false, protocol(waE2E.ProtocolMessage_MESSAGE_EDIT, target, text("FORGED"))))
+		bridge.ingest(ctx, live("X2"+target, familyJID, bob, false, protocol(waE2E.ProtocolMessage_REVOKE, target, nil)))
+		bridge.ingest(ctx, live(target, familyJID, bob, false, text("REPLACED")))
+	}
+	if r, ok := bridge.row(t, "ALICE1"); !ok || r.content != "from Alice" || r.sender != alice.User {
+		t.Errorf("ALICE1 = %+v (stored %v)", r, ok)
+	}
+	if r, ok := bridge.row(t, "MINE1"); !ok || r.content != "from me" || !r.fromMe || r.sender != me.User {
+		t.Errorf("MINE1 = %+v (stored %v)", r, ok)
+	}
+
+	// The real senders still can
+	bridge.ingest(ctx, live("E1", familyJID, alice, false, protocol(waE2E.ProtocolMessage_MESSAGE_EDIT, "ALICE1", text("Alice, edited"))))
+	if r, _ := bridge.row(t, "ALICE1"); r.content != "Alice, edited" {
+		t.Errorf("Alice's own edit was not applied: %q", r.content)
+	}
+	bridge.ingest(ctx, live("E2", familyJID, myDevice, true, protocol(waE2E.ProtocolMessage_REVOKE, "MINE1", nil)))
+	if _, ok := bridge.row(t, "MINE1"); ok {
+		t.Errorf("my own deletion was not applied")
+	}
+	// A message delivered twice by its sender is stored once, with the latest content
+	bridge.ingest(ctx, live("ALICE1", familyJID, alice, false, text("redelivered")))
+	if r, _ := bridge.row(t, "ALICE1"); r.content != "redelivered" {
+		t.Errorf("redelivery by the sender = %q", r.content)
+	}
+}
+
+func TestIngestDuringMergeLosesNothing(t *testing.T) {
+	bridge := newIngestBridge(t)
+	ctx := context.Background()
+	const perWorker, workers = 150, 6
+
+	done := make(chan struct{})
+	for w := 0; w < workers; w++ {
+		go func(w int) {
+			defer func() { done <- struct{}{} }()
+			for i := 0; i < perWorker; i++ {
+				// A hidden chat whose number becomes known half way through
+				hidden := types.NewJID(fmt.Sprintf("7000000%02d", w), types.HiddenUserServer)
+				if i == perWorker/2 {
+					bridge.client.Store.LIDs.PutLIDMapping(ctx, hidden, types.NewJID(fmt.Sprintf("2783000%02d", w), types.DefaultUserServer))
+				}
+				bridge.ingest(ctx, live(fmt.Sprintf("W%d-%d", w, i), hidden, hidden, false, text("x")))
+			}
+		}(w)
+	}
+	stop := make(chan struct{})
+	merged := make(chan struct{})
+	go func() {
+		defer close(merged)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				bridge.mergeHiddenIdentities(ctx)
+			}
+		}
+	}()
+	for w := 0; w < workers; w++ {
+		<-done
+	}
+	close(stop)
+	<-merged
+	bridge.mergeHiddenIdentities(ctx)
+
+	var count int
+	bridge.store.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&count)
+	if count != perWorker*workers {
+		t.Errorf("stored %d of %d messages", count, perWorker*workers)
+	}
+	if chats, _ := bridge.store.HiddenChats(); len(chats) != 0 {
+		t.Errorf("hidden chats remain: %v", chats)
 	}
 }

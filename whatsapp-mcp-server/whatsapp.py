@@ -3,6 +3,7 @@ import logging
 import os
 import os.path
 import pathlib
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ MAX_CHAT_LIMIT = 200
 MAX_CONTEXT = 100
 PREVIEW_LENGTH = 300
 SEND_TIMEOUT = 30
+SEND_MEDIA_TIMEOUT = 180  # includes the upload
 DOWNLOAD_TIMEOUT = 180
 
 USER_SERVER = "@s.whatsapp.net"
@@ -71,6 +73,8 @@ def _connect_readonly(path: str) -> sqlite3.Connection:
     uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5)
     conn.row_factory = sqlite3.Row
+    # SQLite's own LIKE and LOWER only fold ASCII case
+    conn.create_function("casefold", 1, lambda text: text.casefold() if isinstance(text, str) else text, deterministic=True)
     return conn
 
 @contextmanager
@@ -214,10 +218,10 @@ class _Names:
         user = jid.split("@")[0]
         name = self.contacts.get(jid)
         if name:
-            return name
+            return _display_name(name)
         # chats.name falls back to the number, which is not a real name.
         if chat_name and chat_name.strip() and chat_name != user and chat_name != jid:
-            return chat_name
+            return _display_name(chat_name)
         if jid.endswith(LID_SERVER):
             return f"unknown ({jid})"  # a hidden ID, not a phone number
         return user
@@ -234,7 +238,7 @@ class _Names:
     def chat(self, jid: str, chat_name: Optional[str]) -> str:
         """Display name for a chat."""
         if jid.endswith(GROUP_SERVER):
-            return chat_name or jid
+            return _display_name(chat_name) if chat_name else jid
         return self._person(jid, chat_name)
 
 
@@ -242,15 +246,41 @@ class _Names:
 # Formatting
 # ---------------------------------------------------------------------------
 
+# Everything below is written by other people (message text, file names, the names
+# they give themselves and their groups, even message IDs), so none of it may be
+# able to imitate the structure of a transcript.
+
+def _one_line(text: Any) -> str:
+    """Collapse line breaks and other whitespace runs to single spaces."""
+    return " ".join(str(text).split())
+
+def _display_name(name: str) -> str:
+    name = _one_line(name)
+    # "Me" is how the account owner is shown; nobody else may appear under it
+    if name.casefold() in ("me", "me:"):
+        return f'"{name}" (a contact, not you)'
+    return name
+
+def _display_id(message_id: Any) -> str:
+    message_id = str(message_id)
+    return message_id if re.fullmatch(r"[A-Za-z0-9_.:@-]+", message_id) else json.dumps(message_id)
+
 def _media_marker(row: sqlite3.Row) -> str:
     if not row["media_type"]:
         return ""
+    media_type = _one_line(row["media_type"]).replace("]", ")")
     if row["filename"]:
-        return f"[{row['media_type']}: {row['filename']}] "
-    return f"[{row['media_type']}] "
+        return f"[{media_type}: {_one_line(row['filename']).replace(']', ')')}] "
+    return f"[{media_type}] "
 
 def _message_text(row: sqlite3.Row) -> str:
-    return (_media_marker(row) + (row["content"] or "")).strip()
+    """Media marker plus text. Further lines of a message are indented, so only a
+    real message can start at the beginning of a line."""
+    content = "\n    ".join((row["content"] or "").splitlines())
+    return (_media_marker(row) + content).strip()
+
+def _preview_text(row: sqlite3.Row) -> str:
+    return (_media_marker(row) + _one_line(row["content"] or "")).strip()
 
 def _format_transcript(
     names: _Names,
@@ -289,7 +319,7 @@ def _format_transcript(
             previous_position = position
             who = "Me" if row["is_from_me"] else names.sender(row["sender"])
             mark = "> " if marked and (row["id"], row["chat_jid"]) in marked else ""
-            lines.append(f"{mark}[{clock} id={row['id']}] {who}: {_message_text(row)}")
+            lines.append(f"{mark}[{clock} id={_display_id(row['id'])}] {who}: {_message_text(row)}")
     return "\n".join(lines)
 
 def _chat_positions(conn: sqlite3.Connection, chat_jid: str) -> List[int]:
@@ -375,8 +405,8 @@ def list_messages(
         where_clauses.append("m.chat_jid = ?")
         params.append(chat_jid.strip())
     if query:
-        where_clauses.append("m.content LIKE ? ESCAPE '\\'")
-        params.append(_like(query))
+        where_clauses.append("instr(casefold(m.content), ?) > 0")
+        params.append(query.casefold())
 
     sql = f"SELECT {MESSAGE_COLUMNS} FROM messages m LEFT JOIN chats c ON c.jid = m.chat_jid"
     if where_clauses:
@@ -500,7 +530,7 @@ def _chat_dict(row: sqlite3.Row, names: _Names, include_last_message: bool = Tru
         "last_message_time": _local_iso(row["last_message_time"] or row["timestamp"]),
     }
     if include_last_message and row["timestamp"] is not None:
-        text = _message_text(row)
+        text = _preview_text(row)
         if len(text) > PREVIEW_LENGTH:
             text = text[:PREVIEW_LENGTH] + "..."
         chat["last_message"] = text
@@ -717,7 +747,7 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     if not os.path.isfile(media_path):
         return _failure(f"Media file not found: {media_path}")
     payload = {"recipient": recipient, "message": "", "media_path": os.path.abspath(media_path)}
-    return _send_result(_bridge_post("send", payload, SEND_TIMEOUT))
+    return _send_result(_bridge_post("send", payload, SEND_MEDIA_TIMEOUT))
 
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     if not recipient:
@@ -735,7 +765,7 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
             except Exception as e:
                 return _failure(f"Error converting file to opus ogg. You likely need to install ffmpeg: {e}")
         payload = {"recipient": recipient, "message": "", "media_path": os.path.abspath(temp_path or media_path)}
-        return _send_result(_bridge_post("send", payload, SEND_TIMEOUT))
+        return _send_result(_bridge_post("send", payload, SEND_MEDIA_TIMEOUT))
     finally:
         if temp_path and os.path.exists(temp_path):
             try:

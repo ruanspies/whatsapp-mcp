@@ -3,11 +3,12 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
 // Database handler for storing message history
@@ -93,6 +94,7 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 
 		CREATE INDEX IF NOT EXISTS messages_chat_time ON messages (chat_jid, timestamp);
 		CREATE INDEX IF NOT EXISTS messages_time ON messages (timestamp);
+		CREATE INDEX IF NOT EXISTS messages_sender ON messages (sender);
 	`)
 	if err != nil {
 		db.Close()
@@ -107,6 +109,11 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 			db.Close()
 			return nil, err
 		}
+	}
+
+	if err := store.migrateTimestamps(); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	restrictFiles(storeDir)
@@ -124,6 +131,54 @@ func (store *MessageStore) addMessageColumn(column string) error {
 	}
 	if _, err := store.db.Exec("ALTER TABLE messages ADD COLUMN " + column + " TEXT"); err != nil {
 		return fmt.Errorf("failed to add column %s: %v", column, err)
+	}
+	return nil
+}
+
+// migrateTimestamps rewrites timestamps written by earlier versions of the bridge,
+// which stored local time with its offset, into the UTC format used now
+func (store *MessageStore) migrateTimestamps() error {
+	const current = "____-__-__ __:__:__+00:00"
+
+	for _, target := range []struct{ table, column string }{{"messages", "timestamp"}, {"chats", "last_message_time"}} {
+		rows, err := store.db.Query(
+			"SELECT rowid, CAST("+target.column+" AS TEXT) FROM "+target.table+" WHERE "+target.column+" IS NOT NULL AND "+target.column+" NOT LIKE ?", current)
+		if err != nil {
+			return fmt.Errorf("failed to inspect %s timestamps: %v", target.table, err)
+		}
+		converted := map[int64]string{}
+		for rows.Next() {
+			var rowid int64
+			var value string
+			if err := rows.Scan(&rowid, &value); err != nil {
+				rows.Close()
+				return fmt.Errorf("failed to read %s timestamps: %v", target.table, err)
+			}
+			for _, layout := range sqlite3.SQLiteTimestampFormats {
+				if parsed, err := time.ParseInLocation(layout, value, time.UTC); err == nil {
+					converted[rowid] = formatTimestamp(parsed)
+					break
+				}
+			}
+		}
+		rows.Close()
+		if len(converted) == 0 {
+			continue
+		}
+
+		tx, err := store.db.Begin()
+		if err != nil {
+			return err
+		}
+		for rowid, value := range converted {
+			if _, err := tx.Exec("UPDATE "+target.table+" SET "+target.column+" = ? WHERE rowid = ?", value, rowid); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("failed to convert %s timestamps: %v", target.table, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -177,33 +232,48 @@ func (store *MessageStore) ChatName(jid string) (string, bool) {
 	return name.String, true
 }
 
-// Store a message in the database
+// Store a message in the database. Message IDs are chosen by the sender, so a
+// message that reuses an ID only replaces the stored one when it comes from the
+// same sender; anyone else's is ignored.
 func (store *MessageStore) StoreMessage(msg StoredMessage) error {
 	// Only store if there's actual content or media
 	if msg.Content == "" && msg.Media.Type == "" {
 		return nil
 	}
 
+	// The length is whatever the sender declared, and SQLite integers are signed
+	fileLength := int64(math.MaxInt64)
+	if msg.Media.FileLength < math.MaxInt64 {
+		fileLength = int64(msg.Media.FileLength)
+	}
+
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages
+		`INSERT INTO messages
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, direct_path, mime_type)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			content = excluded.content, timestamp = excluded.timestamp, media_type = excluded.media_type, filename = excluded.filename,
+			url = excluded.url, media_key = excluded.media_key, file_sha256 = excluded.file_sha256, file_enc_sha256 = excluded.file_enc_sha256,
+			file_length = excluded.file_length, direct_path = excluded.direct_path, mime_type = excluded.mime_type
+		WHERE messages.sender = excluded.sender AND messages.is_from_me = excluded.is_from_me`,
 		msg.ID, msg.ChatJID, msg.Sender, msg.Content, formatTimestamp(msg.Timestamp), msg.IsFromMe,
 		msg.Media.Type, msg.Media.Filename, msg.Media.URL, msg.Media.MediaKey, msg.Media.FileSHA256, msg.Media.FileEncSHA256,
-		msg.Media.FileLength, msg.Media.DirectPath, msg.Media.MimeType,
+		fileLength, msg.Media.DirectPath, msg.Media.MimeType,
 	)
 	return err
 }
 
-// UpdateMessageContent replaces the text of a message that was edited
-func (store *MessageStore) UpdateMessageContent(id, chatJID, content string) error {
-	_, err := store.db.Exec("UPDATE messages SET content = ? WHERE id = ? AND chat_jid = ?", content, id, chatJID)
+// UpdateMessageContent replaces the text of a message that its own sender edited
+func (store *MessageStore) UpdateMessageContent(id, chatJID, sender string, isFromMe bool, content string) error {
+	_, err := store.db.Exec("UPDATE messages SET content = ? WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = ?",
+		content, id, chatJID, sender, isFromMe)
 	return err
 }
 
-// DeleteMessage removes a message that was deleted for everyone
-func (store *MessageStore) DeleteMessage(id, chatJID string) error {
-	_, err := store.db.Exec("DELETE FROM messages WHERE id = ? AND chat_jid = ?", id, chatJID)
+// DeleteMessage removes a message that its own sender deleted for everyone
+func (store *MessageStore) DeleteMessage(id, chatJID, sender string, isFromMe bool) error {
+	_, err := store.db.Exec("DELETE FROM messages WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = ?",
+		id, chatJID, sender, isFromMe)
 	return err
 }
 

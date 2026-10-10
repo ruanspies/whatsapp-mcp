@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net"
 	"net/http"
@@ -313,24 +314,59 @@ func (b *Bridge) mediaPath(messageID, chatJID string, media MediaInfo) (string, 
 	return path, nil
 }
 
-// Extract direct path from a WhatsApp media URL
-func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
+// cappedFile is a download target that refuses to grow past a limit. It wraps the
+// file rather than embedding it so that every write goes through the check.
+type cappedFile struct {
+	file     *os.File
+	limit    int64
+	exceeded bool
+}
 
-	// Find the path part after the domain
-	parts := strings.SplitN(url, ".net/", 2)
-	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+var errMediaTooLarge = errors.New("media is over the download limit")
+
+func (c *cappedFile) Write(p []byte) (int, error) {
+	offset, err := c.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
 	}
+	if offset+int64(len(p)) > c.limit {
+		c.exceeded = true
+		return 0, errMediaTooLarge
+	}
+	return c.file.Write(p)
+}
 
-	pathPart := parts[1]
+func (c *cappedFile) WriteAt(p []byte, offset int64) (int, error) {
+	if offset+int64(len(p)) > c.limit {
+		c.exceeded = true
+		return 0, errMediaTooLarge
+	}
+	return c.file.WriteAt(p, offset)
+}
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
+func (c *cappedFile) Truncate(size int64) error {
+	if size > c.limit {
+		c.exceeded = true
+		return errMediaTooLarge
+	}
+	return c.file.Truncate(size)
+}
 
-	// Create proper direct path format
-	return "/" + pathPart
+func (c *cappedFile) Read(p []byte) (int, error)                { return c.file.Read(p) }
+func (c *cappedFile) ReadAt(p []byte, off int64) (int, error)   { return c.file.ReadAt(p, off) }
+func (c *cappedFile) Seek(off int64, whence int) (int64, error) { return c.file.Seek(off, whence) }
+func (c *cappedFile) Stat() (os.FileInfo, error)                { return c.file.Stat() }
+
+// Extract direct path from a WhatsApp media URL. Only messages stored by an
+// older version of the bridge need this; newer ones carry the direct path.
+func extractDirectPathFromURL(url string) string {
+	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
+	// The direct path is everything after the domain, query included
+	parts := strings.SplitN(url, ".net/", 2)
+	if len(parts) < 2 || !strings.Contains(parts[1], "?") {
+		return ""
+	}
+	return "/" + parts[1]
 }
 
 // Function to download media from a message
@@ -387,28 +423,33 @@ func (b *Bridge) downloadMedia(ctx context.Context, messageID, chatJID string) (
 		return media, "", refuse(http.StatusServiceUnavailable, "Not connected to WhatsApp")
 	}
 
-	// Download the media using whatsmeow client
+	// Download straight to a file, so the size limit holds whatever length the sender declared
+	if err := os.MkdirAll(filepath.Dir(localPath), 0700); err != nil {
+		return media, "", refuse(http.StatusInternalServerError, "Failed to create media directory: %v", err)
+	}
+	partial, err := os.CreateTemp(filepath.Dir(localPath), ".download-*")
+	if err != nil {
+		return media, "", refuse(http.StatusInternalServerError, "Failed to save media file: %v", err)
+	}
+	defer os.Remove(partial.Name())
+	defer partial.Close()
+
 	ctx, cancel := context.WithTimeout(ctx, 150*time.Second)
 	defer cancel()
-	mediaData, err := b.client.DownloadMediaWithPath(ctx, directPath, media.FileEncSHA256, media.FileSHA256, media.MediaKey, waMediaType, "", len(media.FileSHA256) == 0)
+	// The encrypted file is slightly longer than the media itself
+	target := &cappedFile{file: partial, limit: b.cfg.MaxDownloadBytes + 1<<16}
+	err = b.client.DownloadMediaWithPathToFile(ctx, directPath, media.FileEncSHA256, media.FileSHA256, media.MediaKey, waMediaType, "", len(media.FileSHA256) == 0, target)
+	if target.exceeded {
+		return media, "", refuse(http.StatusRequestEntityTooLarge, "Media is over the %d MB download limit (WHATSAPP_MCP_MAX_DOWNLOAD_MB)", b.cfg.MaxDownloadBytes>>20)
+	}
 	if err != nil {
 		return media, "", refuse(http.StatusInternalServerError, "Failed to download media (old media may no longer be on WhatsApp's servers): %v", err)
 	}
 
-	if int64(len(mediaData)) > b.cfg.MaxDownloadBytes {
-		return media, "", refuse(http.StatusRequestEntityTooLarge, "Media is over the %d MB download limit (WHATSAPP_MCP_MAX_DOWNLOAD_MB)", b.cfg.MaxDownloadBytes>>20)
-	}
-
-	// Save the downloaded media to file
-	if err := os.MkdirAll(filepath.Dir(localPath), 0700); err != nil {
-		return media, "", refuse(http.StatusInternalServerError, "Failed to create media directory: %v", err)
-	}
-	partialPath := localPath + ".part"
-	if err := os.WriteFile(partialPath, mediaData, 0600); err != nil {
+	if err := partial.Close(); err != nil {
 		return media, "", refuse(http.StatusInternalServerError, "Failed to save media file: %v", err)
 	}
-	if err := os.Rename(partialPath, localPath); err != nil {
-		os.Remove(partialPath)
+	if err := os.Rename(partial.Name(), localPath); err != nil {
 		return media, "", refuse(http.StatusInternalServerError, "Failed to save media file: %v", err)
 	}
 

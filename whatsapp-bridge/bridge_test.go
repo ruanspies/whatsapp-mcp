@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -323,13 +324,13 @@ func TestStoreChatAndTimestamps(t *testing.T) {
 	}
 
 	store.StoreMessage(StoredMessage{ID: "A", ChatJID: chat, Sender: "27820000001", Content: "first", Timestamp: newer})
-	store.UpdateMessageContent("A", chat, "edited")
+	store.UpdateMessageContent("A", chat, "27820000001", false, "edited")
 	var content, timestamp string
 	store.db.QueryRow("SELECT content, CAST(timestamp AS TEXT) FROM messages WHERE id = 'A'").Scan(&content, &timestamp)
 	if content != "edited" || timestamp != "2026-10-10 15:04:05+00:00" {
 		t.Errorf("message = %q at %q", content, timestamp)
 	}
-	store.DeleteMessage("A", chat)
+	store.DeleteMessage("A", chat, "27820000001", false)
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&count)
 	if count != 0 {
@@ -462,4 +463,104 @@ func TestServerListensOnLoopbackOnly(t *testing.T) {
 		}
 	}
 	t.Logf("checked %d non-loopback addresses", checked)
+}
+
+func TestLegacyTimestampsAreMigrated(t *testing.T) {
+	bridge := newTestBridge(t)
+	storeDir := bridge.cfg.StoreDir
+	chat := "27820000001@s.whatsapp.net"
+
+	// Rows as the earlier version wrote them: local time with its offset
+	bridge.store.db.Exec("INSERT INTO chats (jid, name, last_message_time) VALUES (?, 'Alice', '2026-10-09 09:30:00+02:00')", chat)
+	bridge.store.db.Exec("INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES ('OLD', ?, '27820000001', 'old', '2026-10-09 09:30:00+02:00', 0)", chat)
+	bridge.store.db.Exec("INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES ('NEW', ?, '27820000001', 'new', '2026-10-09 08:00:00+00:00', 0)", chat)
+	bridge.store.Close()
+
+	reopened, err := NewMessageStore(storeDir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	var old, current, last string
+	reopened.db.QueryRow("SELECT CAST(timestamp AS TEXT) FROM messages WHERE id = 'OLD'").Scan(&old)
+	reopened.db.QueryRow("SELECT CAST(timestamp AS TEXT) FROM messages WHERE id = 'NEW'").Scan(&current)
+	reopened.db.QueryRow("SELECT CAST(last_message_time AS TEXT) FROM chats WHERE jid = ?", chat).Scan(&last)
+	if old != "2026-10-09 07:30:00+00:00" || last != "2026-10-09 07:30:00+00:00" || current != "2026-10-09 08:00:00+00:00" {
+		t.Errorf("after migration: old %q, chat %q, current %q", old, last, current)
+	}
+}
+
+func TestHugeDeclaredLengthIsStored(t *testing.T) {
+	bridge := newTestBridge(t)
+	chat := "27820000001@s.whatsapp.net"
+	bridge.store.StoreChat(chat, "Alice", time.Now())
+	err := bridge.store.StoreMessage(StoredMessage{ID: "BIG", ChatJID: chat, Sender: "27820000001", Content: "caption", Timestamp: time.Now(),
+		Media: MediaInfo{Type: "document", FileLength: 1 << 63}})
+	if err != nil {
+		t.Fatalf("StoreMessage: %v", err)
+	}
+	if media, err := bridge.store.GetMediaInfo("BIG", chat); err != nil || media.FileLength == 0 {
+		t.Errorf("GetMediaInfo = %+v, %v", media, err)
+	}
+	if status, _ := post(bridge.testServer(), "/api/download", `{"message_id":"BIG","chat_jid":"`+chat+`"}`, nil); status != http.StatusRequestEntityTooLarge {
+		t.Errorf("download of a huge declared length: status %d, want 413", status)
+	}
+}
+
+func TestCappedFile(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "capped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	capped := &cappedFile{file: file, limit: 10}
+
+	// io.Copy must not find a way around Write
+	if _, ok := interface{}(capped).(io.ReaderFrom); ok {
+		t.Fatalf("cappedFile exposes ReadFrom, which bypasses the limit")
+	}
+	if _, err := io.Copy(capped, strings.NewReader("0123456789")); err != nil || capped.exceeded {
+		t.Fatalf("write up to the limit: %v", err)
+	}
+	if _, err := io.Copy(capped, strings.NewReader("x")); err == nil || !capped.exceeded {
+		t.Errorf("write past the limit was accepted")
+	}
+	if _, err := capped.WriteAt([]byte("xx"), 9); err == nil {
+		t.Errorf("WriteAt past the limit was accepted")
+	}
+	if err := capped.Truncate(11); err == nil {
+		t.Errorf("Truncate past the limit was accepted")
+	}
+	if info, _ := file.Stat(); info.Size() != 10 {
+		t.Errorf("file grew to %d bytes", info.Size())
+	}
+}
+
+func TestStoreFilesCannotBeSent(t *testing.T) {
+	bridge := newTestBridge(t)
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "photo.jpg"), []byte("x"), 0600)
+	os.Symlink(filepath.Join(bridge.cfg.StoreDir, "messages.db"), filepath.Join(outside, "holiday.jpg"))
+	os.Symlink(bridge.cfg.StoreDir, filepath.Join(outside, "album"))
+
+	inside := []string{
+		filepath.Join(bridge.cfg.StoreDir, "whatsapp.db"),
+		filepath.Join(bridge.cfg.StoreDir, "api_token"),
+		filepath.Join(bridge.cfg.StoreDir, "media", "x", "y.jpg"),
+		filepath.Join(bridge.cfg.StoreDir, "..", "store", "api_token"),
+		filepath.Join(outside, "holiday.jpg"),
+		filepath.Join(outside, "album", "api_token"),
+		bridge.cfg.StoreDir,
+	}
+	for _, path := range inside {
+		if !bridge.insideStore(path) {
+			t.Errorf("insideStore(%q) = false", path)
+		}
+	}
+	for _, path := range []string{filepath.Join(outside, "photo.jpg"), bridge.cfg.StoreDir + "-other/file", "/etc/hosts"} {
+		if bridge.insideStore(path) {
+			t.Errorf("insideStore(%q) = true", path)
+		}
+	}
 }

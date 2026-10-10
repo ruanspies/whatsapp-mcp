@@ -131,9 +131,11 @@ The bridge exposes a small REST API that the MCP server calls. It is locked down
 - It listens on `127.0.0.1` only, so other devices on your network cannot reach it
 - Every request needs the token in `whatsapp-bridge/store/api_token`, which the bridge creates on first start
 - Requests from web pages are refused (no `Origin` header allowed, `Content-Type` must be `application/json`, `Host` must be local)
-- Messages can only be sent to chats that already exist in your history, never to a new number
+- Messages can only be sent to chats that already exist in your history, never to a new number. Note that anyone who has messaged you, or added you to a group, is an existing chat; set `WHATSAPP_MCP_SEND_ALLOWLIST` if you want to restrict sending to named people and groups
 - Sending files is off unless you enable it (see below)
 - Downloaded media is saved under a name built from the message ID, never the file name the sender chose
+- Only the sender of a message can edit or delete the stored copy of it
+- In transcripts, a line that is not indented is always a real message; text inside a message cannot imitate one
 
 Messages you receive are text written by other people, and the model reads them. A message can try to instruct the model (prompt injection). Keep the approval prompt for `send_message` switched on in your client, and treat downloaded files as untrusted.
 
@@ -177,7 +179,7 @@ The MCP server supports both sending and receiving various media types:
 
 #### Media Sending
 
-Sending files is disabled by default. Start both the bridge and the MCP server with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1` to enable it. Once enabled, the bridge will send any file your user can read, so only turn it on if you need it.
+Sending files is disabled by default. Start both the bridge and the MCP server with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1` to enable it. Once enabled, the bridge will send any file your user can read (except its own store directory), so only turn it on if you need it.
 
 You can send various media types to your WhatsApp contacts:
 

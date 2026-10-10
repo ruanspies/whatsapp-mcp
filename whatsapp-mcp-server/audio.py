@@ -35,6 +35,7 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
     # Build the ffmpeg command
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-i", input_file,
         "-c:a", "libopus",
         "-b:a", bitrate,
@@ -51,6 +52,7 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
         # Run the ffmpeg command and capture output
         process = subprocess.run(
             cmd,
+            stdin=subprocess.DEVNULL,  # never let ffmpeg read the MCP protocol stream
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

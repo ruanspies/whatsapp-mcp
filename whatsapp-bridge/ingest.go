@@ -22,6 +22,10 @@ type Bridge struct {
 
 	// Groups whose name is currently being fetched
 	groupLookups sync.Map
+
+	// Held while a message is stored and while hidden chats are merged, so a
+	// chat cannot be merged away between choosing it and storing into it
+	storeLock sync.Mutex
 }
 
 // Extract text content from a message, including the caption of media
@@ -156,22 +160,26 @@ func (b *Bridge) ingest(ctx context.Context, evt *events.Message) types.JID {
 		msg = wrapped
 	}
 
+	b.storeLock.Lock()
+	defer b.storeLock.Unlock()
+
 	chat := b.chatJID(ctx, info)
 	chatJID := chat.String()
+	sender := b.senderID(ctx, info)
 
-	// Edits and deletions change a message that is already stored
+	// Edits and deletions change a message that is already stored, and only its own sender may make them
 	if protocol := msg.GetProtocolMessage(); protocol != nil {
 		targetID := protocol.GetKey().GetID()
 		switch protocol.GetType() {
 		case waE2E.ProtocolMessage_MESSAGE_EDIT:
 			if content := extractTextContent(protocol.GetEditedMessage()); content != "" && targetID != "" {
-				if err := b.store.UpdateMessageContent(targetID, chatJID, content); err != nil {
+				if err := b.store.UpdateMessageContent(targetID, chatJID, sender, info.IsFromMe, content); err != nil {
 					b.logger.Warnf("Failed to store edit: %v", err)
 				}
 			}
 		case waE2E.ProtocolMessage_REVOKE:
 			if targetID != "" {
-				if err := b.store.DeleteMessage(targetID, chatJID); err != nil {
+				if err := b.store.DeleteMessage(targetID, chatJID, sender, info.IsFromMe); err != nil {
 					b.logger.Warnf("Failed to store deletion: %v", err)
 				}
 			}
@@ -196,7 +204,7 @@ func (b *Bridge) ingest(ctx context.Context, evt *events.Message) types.JID {
 	err := b.store.StoreMessage(StoredMessage{
 		ID:        info.ID,
 		ChatJID:   chatJID,
-		Sender:    b.senderID(ctx, info),
+		Sender:    sender,
 		Content:   content,
 		Timestamp: info.Timestamp,
 		IsFromMe:  info.IsFromMe,
@@ -349,6 +357,9 @@ func (b *Bridge) loadGroupNames(ctx context.Context) {
 // mergeHiddenIdentities moves chats and senders stored under a hidden address to
 // the phone number, for every hidden address whose phone number is now known
 func (b *Bridge) mergeHiddenIdentities(ctx context.Context) {
+	b.storeLock.Lock()
+	defer b.storeLock.Unlock()
+
 	chats, err := b.store.HiddenChats()
 	if err != nil {
 		b.logger.Warnf("Failed to list hidden chats: %v", err)

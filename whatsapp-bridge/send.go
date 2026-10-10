@@ -35,6 +35,11 @@ func (b *Bridge) sendWhatsAppMessage(ctx context.Context, chatJID string, messag
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// The store holds the session keys and the API token; those never leave this machine
+		if b.insideStore(mediaPath) {
+			return refuse(http.StatusForbidden, "Files inside the bridge's store directory cannot be sent")
+		}
+
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -175,6 +180,8 @@ func (b *Bridge) sendWhatsAppMessage(ctx context.Context, chatJID string, messag
 	}
 
 	// WhatsApp does not echo a device's own messages back to it, so record the message here
+	b.storeLock.Lock()
+	defer b.storeLock.Unlock()
 	if err := b.store.StoreChat(chatJID, recipientJID.User, resp.Timestamp); err != nil {
 		b.logger.Warnf("Failed to store chat: %v", err)
 	}
@@ -196,6 +203,44 @@ func (b *Bridge) sendWhatsAppMessage(ctx context.Context, chatJID string, messag
 	}
 
 	return nil
+}
+
+// resolvePath makes a path absolute and follows the symbolic links in it. Parts
+// that do not exist yet are kept as they are, after resolving what does exist.
+func resolvePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	existing, rest := absolute, ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(existing); err == nil {
+			return filepath.Join(resolved, rest), nil
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return absolute, nil
+		}
+		rest = filepath.Join(filepath.Base(existing), rest)
+		existing = parent
+	}
+}
+
+// insideStore reports whether a path, with symbolic links followed, is the store directory or inside it
+func (b *Bridge) insideStore(path string) bool {
+	storeDir, err := resolvePath(b.cfg.StoreDir)
+	if err != nil {
+		return true
+	}
+	target, err := resolvePath(path)
+	if err != nil {
+		return true
+	}
+	relative, err := filepath.Rel(storeDir, target)
+	if err != nil {
+		return false
+	}
+	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
