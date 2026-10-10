@@ -19,7 +19,7 @@ Here's an example of what you can do when it's connected to Claude.
 ### Prerequisites
 
 - Go
-- Python 3.6+
+- Python 3.11+ (installed automatically by UV)
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
@@ -29,7 +29,7 @@ Here's an example of what you can do when it's connected to Claude.
 1. **Clone this repository**
 
    ```bash
-   git clone https://github.com/lharries/whatsapp-mcp.git
+   git clone https://github.com/ruanspies/whatsapp-mcp.git
    cd whatsapp-mcp
    ```
 
@@ -39,12 +39,14 @@ Here's an example of what you can do when it's connected to Claude.
 
    ```bash
    cd whatsapp-bridge
-   go run main.go
+   go run .
    ```
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
 
    After approximately 20 days, you will might need to re-authenticate.
+
+   Always start the bridge from the `whatsapp-bridge` directory: it keeps its data in `./store`, which is where the MCP server looks for it.
 
 3. **Connect to the MCP server**
 
@@ -99,7 +101,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    ```bash
    cd whatsapp-bridge
    go env -w CGO_ENABLED=1
-   go run main.go
+   go run .
    ```
 
 Without this setup, you'll likely run into errors like:
@@ -119,6 +121,34 @@ This application consists of two main components:
 - All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
+- Downloaded media is saved under `whatsapp-bridge/store/media/`
+- The store directory and everything in it is readable by your user only. `whatsapp.db` holds your WhatsApp session keys: anyone who copies it can act as your account, so never share or commit it
+
+## Security
+
+The bridge exposes a small REST API that the MCP server calls. It is locked down as follows:
+
+- It listens on `127.0.0.1` only, so other devices on your network cannot reach it
+- Every request needs the token in `whatsapp-bridge/store/api_token`, which the bridge creates on first start
+- Requests from web pages are refused (no `Origin` header allowed, `Content-Type` must be `application/json`, `Host` must be local)
+- Messages can only be sent to chats that already exist in your history, never to a new number
+- Sending files is off unless you enable it (see below)
+- Downloaded media is saved under a name built from the message ID, never the file name the sender chose
+
+Messages you receive are text written by other people, and the model reads them. A message can try to instruct the model (prompt injection). Keep the approval prompt for `send_message` switched on in your client, and treat downloaded files as untrusted.
+
+### Configuration
+
+Set these environment variables for the bridge. Those marked "both" must also be set for the MCP server (in the `env` block of its entry in your client's config).
+
+| Variable | Default | Applies to | Meaning |
+|---|---|---|---|
+| `WHATSAPP_MCP_READ_ONLY` | off | both | `1` disables all sending |
+| `WHATSAPP_MCP_ENABLE_SEND_MEDIA` | off | both | `1` enables `send_file` and `send_audio_message` |
+| `WHATSAPP_MCP_SEND_ALLOWLIST` | empty | bridge | Comma-separated phone numbers or JIDs; when set, messages can only be sent to these chats |
+| `WHATSAPP_MCP_MAX_DOWNLOAD_MB` | 100 | bridge | Largest media file that will be downloaded |
+| `WHATSAPP_MCP_PORT` | 8080 | both | Port of the REST API on localhost |
+| `WHATSAPP_MCP_STORE_DIR` | `whatsapp-bridge/store` | both | Where the databases, token and media are kept |
 
 ## Usage
 
@@ -136,9 +166,9 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
-- **send_message**: Send a WhatsApp message to a specified phone number or group JID
-- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
-- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
+- **send_message**: Send a WhatsApp message to an existing chat, by phone number or group JID
+- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient. Only available with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1`
+- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed). Only available with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1`
 - **download_media**: Download media from a WhatsApp message and get the local file path
 
 ### Media Handling Features
@@ -146,6 +176,8 @@ Claude can access the following tools to interact with WhatsApp:
 The MCP server supports both sending and receiving various media types:
 
 #### Media Sending
+
+Sending files is disabled by default. Start both the bridge and the MCP server with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1` to enable it. Once enabled, the bridge will send any file your user can read, so only turn it on if you need it.
 
 You can send various media types to your WhatsApp contacts:
 
@@ -157,7 +189,7 @@ You can send various media types to your WhatsApp contacts:
 
 #### Media Downloading
 
-By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media into `whatsapp-bridge/store/media/` and then returns the file path which can be then opened or passed to another tool.
 
 ## Technical Details
 
@@ -178,6 +210,8 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Already Logged In**: If your session is already active, the Go bridge will automatically reconnect without showing a QR code.
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
+- **"Client outdated (405)" on start**: WhatsApp has stopped accepting the version of the `whatsmeow` library in use. Run `go get go.mau.fi/whatsmeow@latest && go mod tidy` in `whatsapp-bridge` and fix any build errors.
+- **"WhatsApp bridge is not running" from a tool**: Start the bridge (`go run .` in `whatsapp-bridge`) and leave it running.
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
