@@ -7,11 +7,27 @@ cd "${0:A:h}" || exit 1
 port="${WHATSAPP_MCP_PORT:-8080}"
 print -Pn "\e]0;WhatsApp Bridge\a"
 
-# Two bridges on one WhatsApp session would knock each other offline
-if pgrep -qf "${0:A:h}/bin/bridge" || pgrep -qf "go run \.$" || lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "The WhatsApp bridge is already running (something is listening on port $port)."
+# Two bridges on one WhatsApp session would knock each other offline. A bridge is a
+# process started from this folder: bin/bridge, or "go run ." and the program it builds.
+bridge_dir="${0:A:h}"
+running=""
+for pid in $(pgrep -f '(^|/)bin/bridge$|^go run|/exe/whatsapp-client$'); do
+  if [[ "$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" == "$bridge_dir" ]]; then
+    running="$pid"
+    break
+  fi
+done
+if [[ -n "$running" ]]; then
+  echo "The WhatsApp bridge is already running (process $running)."
   echo "You can close this window."
   exit 0
+fi
+
+# Something else on the port would stop the bridge from starting its API
+if listener="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fc 2>/dev/null | sed -n 's/^c//p' | head -1)" && [[ -n "$listener" ]]; then
+  echo "Port $port is in use by another program ($listener), so the bridge cannot start."
+  echo "Stop that program, or start the bridge and the MCP server with WHATSAPP_MCP_PORT set to a free port."
+  exit 1
 fi
 
 # Rebuild when the program is missing or the source has changed since it was built
