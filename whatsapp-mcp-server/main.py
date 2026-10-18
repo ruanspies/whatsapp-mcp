@@ -12,6 +12,7 @@ from whatsapp import (
     get_contact_chats as whatsapp_get_contact_chats,
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
+    get_unread_messages as whatsapp_get_unread_messages,
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
@@ -111,12 +112,19 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    unread_only: bool = False
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp chats (groups and direct chats) matching specified criteria.
 
     Each chat has "jid", "name", "is_group", "last_message_time" (local time with UTC offset)
     and, if requested, "last_message", "last_sender" and "last_is_from_me".
+
+    Read state, as the owner's phone sees it: "unread_count" is the number of messages from
+    others since the chat was last read on any device (null when not known yet),
+    "marked_unread" is true when the owner marked the chat as unread, and "last_read_time" is
+    the point up to which it was read. Reading messages through these tools never marks
+    anything as read.
 
     Args:
         query: Optional search term to filter chats by name or JID
@@ -124,13 +132,15 @@ def list_chats(
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+        unread_only: Only chats with unread messages or marked as unread (default False)
     """
     return whatsapp_list_chats(
         query=query,
         limit=limit,
         page=page,
         include_last_message=include_last_message,
-        sort_by=sort_by
+        sort_by=sort_by,
+        unread_only=unread_only
     )
 
 @mcp.tool()
@@ -193,6 +203,23 @@ def get_message_context(
         after: Number of messages to include after the target message (default 5, maximum 100)
     """
     return whatsapp_get_message_context(message_id, chat_jid, before, after)
+
+@mcp.tool(structured_output=False)  # plain text: don't send the transcript twice
+def get_unread_messages(chat_jid: str, limit: int = 200, context_before: int = 3) -> str:
+    """Get what the owner has not read yet in a chat, in the list_messages transcript format.
+
+    Use it to summarise what was missed: find chats with list_chats(unread_only=True), then
+    call this for each. Unread lines start with "> "; the lines before them are earlier
+    context. The first line says how many are unread and since when. Errors when it is not
+    known yet what was read in the chat; use list_messages with after instead. Reading never
+    marks anything as read on the phone.
+
+    Args:
+        chat_jid: The JID of the chat
+        limit: Maximum number of unread messages to show, newest kept (default 200, maximum 500)
+        context_before: Number of already read messages to show before the first unread one (default 3)
+    """
+    return whatsapp_get_unread_messages(chat_jid, limit, context_before)
 
 if not READ_ONLY:
     @mcp.tool()

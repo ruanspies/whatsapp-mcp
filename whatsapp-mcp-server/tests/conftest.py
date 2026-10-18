@@ -21,7 +21,8 @@ BOB = "27829999999@s.whatsapp.net"
 LOOKALIKE = "127821234567@s.whatsapp.net"
 
 SCHEMA = """
-CREATE TABLE chats(jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP);
+CREATE TABLE chats(jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP,
+    last_read_at TIMESTAMP, marked_unread INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE messages(id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, is_from_me BOOLEAN,
     media_type TEXT, filename TEXT, url TEXT, media_key BLOB, file_sha256 BLOB, file_enc_sha256 BLOB,
     file_length INTEGER, direct_path TEXT, mime_type TEXT, PRIMARY KEY (id, chat_jid));
@@ -49,11 +50,16 @@ MESSAGES = [
     ("L1", LOOKALIKE, "127821234567", "Wrong number sorry", "2026-10-07 06:00:00+00:00", 0, None, None),
 ]
 
+# (jid, name, last_message_time, last_read_at, marked_unread)
 CHATS = [
-    (LOOKALIKE, "Wrong Person", "2026-10-07 06:00:00+00:00"),
-    (GROUP, "Family", "2026-10-09 15:00:00+00:00"),
-    (ALICE, "Alice Chat", "2026-10-09 07:00:00+00:00"),
-    (BOB, "27829999999", "2026-10-09 16:00:00+00:00"),  # name fell back to the number
+    # Read, but marked unread by hand
+    (LOOKALIKE, "Wrong Person", "2026-10-07 06:00:00+00:00", "2026-10-07 06:00:00+00:00", 1),
+    # Read up to G5: G6, DUP1 and G8 from others are unread; G9 is mine
+    (GROUP, "Family", "2026-10-09 15:00:00+00:00", "2026-10-08 22:30:00+00:00", 0),
+    # Read up to my reply: A3 is unread
+    (ALICE, "Alice Chat", "2026-10-09 07:00:00+00:00", "2026-10-08 10:05:00+00:00", 0),
+    # Not known yet
+    (BOB, "27829999999", "2026-10-09 16:00:00+00:00", None, 0),  # name fell back to the number
 ]
 
 # (their_jid, first_name, full_name, push_name, business_name)
@@ -69,7 +75,7 @@ def build_store(path, with_contacts=True, with_token=True):
     os.makedirs(path, exist_ok=True)
     conn = sqlite3.connect(os.path.join(path, "messages.db"))
     conn.executescript(SCHEMA)
-    conn.executemany("INSERT INTO chats VALUES (?, ?, ?)", CHATS)
+    conn.executemany("INSERT INTO chats VALUES (?, ?, ?, ?, ?)", CHATS)
     conn.executemany(
         "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

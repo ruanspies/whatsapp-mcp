@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mattn/go-sqlite3"
@@ -104,8 +105,13 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 	store := &MessageStore{db: db}
 
 	// Databases created by an earlier version lack the newer columns
-	for _, column := range []string{"direct_path", "mime_type"} {
-		if err := store.addMessageColumn(column); err != nil {
+	for _, column := range []struct{ table, name, definition string }{
+		{"messages", "direct_path", "TEXT"},
+		{"messages", "mime_type", "TEXT"},
+		{"chats", "last_read_at", "TIMESTAMP"},
+		{"chats", "marked_unread", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := store.addColumn(column.table, column.name, column.definition); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -116,21 +122,39 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		return nil, err
 	}
 
+	if err := store.backfillReadState(); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	restrictFiles(storeDir)
 	return store, nil
 }
 
-func (store *MessageStore) addMessageColumn(column string) error {
+func (store *MessageStore) addColumn(table, column, definition string) error {
 	var count int
-	err := store.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?", column).Scan(&count)
+	err := store.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", table, column).Scan(&count)
 	if err != nil {
-		return fmt.Errorf("failed to inspect messages table: %v", err)
+		return fmt.Errorf("failed to inspect %s table: %v", table, err)
 	}
 	if count > 0 {
 		return nil
 	}
-	if _, err := store.db.Exec("ALTER TABLE messages ADD COLUMN " + column + " TEXT"); err != nil {
+	if _, err := store.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition); err != nil {
 		return fmt.Errorf("failed to add column %s: %v", column, err)
+	}
+	return nil
+}
+
+// backfillReadState gives chats without a read point the time of my latest
+// message in them: replying means everything before it was read
+func (store *MessageStore) backfillReadState() error {
+	_, err := store.db.Exec(`
+		UPDATE chats SET last_read_at = (
+			SELECT MAX(timestamp) FROM messages WHERE chat_jid = chats.jid AND is_from_me = 1
+		) WHERE last_read_at IS NULL`)
+	if err != nil {
+		return fmt.Errorf("failed to backfill read state: %v", err)
 	}
 	return nil
 }
@@ -230,6 +254,78 @@ func (store *MessageStore) ChatName(jid string) (string, bool) {
 		return "", false
 	}
 	return name.String, true
+}
+
+// AdvanceRead moves the point up to which a chat has been read forward to t.
+// It never moves backwards, so late or repeated signals cannot undo newer ones.
+// When the point moves, a manual "mark as unread" is cleared too, as on the phone.
+func (store *MessageStore) AdvanceRead(jid string, t time.Time) error {
+	ts := formatTimestamp(t)
+	_, err := store.db.Exec(
+		`UPDATE chats SET last_read_at = ?, marked_unread = 0
+		WHERE jid = ? AND (last_read_at IS NULL OR last_read_at < ?)`,
+		ts, jid, ts,
+	)
+	return err
+}
+
+// SetMarkedUnread records whether the chat was manually marked as unread
+func (store *MessageStore) SetMarkedUnread(jid string, marked bool) error {
+	_, err := store.db.Exec("UPDATE chats SET marked_unread = ? WHERE jid = ?", marked, jid)
+	return err
+}
+
+// LatestTimestamp returns the time of the newest stored message among ids in a
+// chat, and false when none of them is stored
+func (store *MessageStore) LatestTimestamp(jid string, ids []string) (time.Time, bool) {
+	if len(ids) == 0 {
+		return time.Time{}, false
+	}
+	args := []interface{}{jid}
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	var latest sql.NullString
+	err := store.db.QueryRow(
+		"SELECT MAX(timestamp) FROM messages WHERE chat_jid = ? AND id IN ("+strings.Join(placeholders, ",")+")", args...,
+	).Scan(&latest)
+	if err != nil || !latest.Valid {
+		return time.Time{}, false
+	}
+	return parseStoredTime(latest.String)
+}
+
+// UnreadBoundary returns the read point that leaves exactly the newest unread
+// messages from other people unread: the time of the next older one, or just
+// before the oldest stored message when fewer are stored. It returns false for
+// a chat without messages.
+func (store *MessageStore) UnreadBoundary(jid string, unread int) (time.Time, bool) {
+	var boundary sql.NullString
+	err := store.db.QueryRow(
+		`SELECT CAST(timestamp AS TEXT) FROM messages WHERE chat_jid = ? AND is_from_me = 0
+		ORDER BY timestamp DESC LIMIT 1 OFFSET ?`, jid, unread,
+	).Scan(&boundary)
+	if err == nil && boundary.Valid {
+		return parseStoredTime(boundary.String)
+	}
+	var oldest sql.NullString
+	if err := store.db.QueryRow("SELECT MIN(timestamp) FROM messages WHERE chat_jid = ?", jid).Scan(&oldest); err != nil || !oldest.Valid {
+		return time.Time{}, false
+	}
+	t, ok := parseStoredTime(oldest.String)
+	return t.Add(-time.Second), ok
+}
+
+// parseStoredTime reads a timestamp in the format written by formatTimestamp
+func parseStoredTime(value string) (time.Time, bool) {
+	for _, layout := range []string{"2006-01-02 15:04:05-07:00", time.RFC3339} {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // Store a message in the database. Message IDs are chosen by the sender, so a
@@ -347,6 +443,20 @@ func (store *MessageStore) MergeChat(fromJID, toJID, fallbackName string) error 
 		ON CONFLICT(jid) DO UPDATE SET last_message_time = excluded.last_message_time
 		WHERE chats.last_message_time IS NULL OR excluded.last_message_time > chats.last_message_time`,
 		toJID, fallbackName, fromJID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Keep the later read point, and the chat marked unread if either one was
+	_, err = tx.Exec(
+		`UPDATE chats SET
+			last_read_at = CASE WHEN chats.last_read_at IS NULL OR src.last_read_at > chats.last_read_at
+				THEN COALESCE(src.last_read_at, chats.last_read_at) ELSE chats.last_read_at END,
+			marked_unread = MAX(chats.marked_unread, src.marked_unread)
+		FROM (SELECT last_read_at, marked_unread FROM chats WHERE jid = ?) AS src
+		WHERE chats.jid = ?`,
+		fromJID, toJID,
 	)
 	if err != nil {
 		return err

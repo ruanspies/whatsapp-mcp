@@ -62,6 +62,9 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	// Chat settings downloaded in full right after pairing include which chats
+	// are marked unread, and are only reported as events with this set
+	client.EmitAppStateEventsOnFullSync = true
 
 	token, err := loadOrCreateToken(cfg.StoreDir)
 	if err != nil {
@@ -85,8 +88,17 @@ func main() {
 			// Process history sync events
 			bridge.handleHistorySync(v)
 
+		case *events.Receipt:
+			bridge.handleReceipt(v)
+
+		case *events.MarkChatAsRead:
+			bridge.handleMarkChatAsRead(v)
+
 		case *events.Contact:
-			bridge.handleContactChange(v.JID)
+			// Skip the flood of contacts a full sync reports, as before full sync events were enabled
+			if !v.FromFullSync {
+				bridge.handleContactChange(v.JID)
+			}
 
 		case *events.PushName:
 			bridge.handleContactChange(v.JID, v.JIDAlt)
@@ -108,6 +120,7 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			go bridge.catchUpAppState(ctx)
 			select {
 			case connected <- struct{}{}:
 			default:

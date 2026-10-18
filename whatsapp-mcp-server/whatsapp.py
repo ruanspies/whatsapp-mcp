@@ -512,6 +512,27 @@ CHAT_COLUMNS = """
     m.content, m.sender, m.is_from_me, m.media_type, m.filename, m.timestamp
 """
 
+# Read state as the bridge records it: the point up to which I have read the chat on
+# any device, and whether I marked it unread. Unread are other people's later messages.
+READ_COLUMNS = """,
+    c.last_read_at, c.marked_unread,
+    CASE WHEN c.last_read_at IS NULL THEN NULL ELSE (
+        SELECT COUNT(*) FROM messages u
+        WHERE u.chat_jid = c.jid AND u.is_from_me = 0 AND u.timestamp > c.last_read_at
+    ) END AS unread_count
+"""
+# A database written by a bridge from before read state was recorded
+NO_READ_COLUMNS = ", NULL AS last_read_at, 0 AS marked_unread, NULL AS unread_count"
+NO_READ_STATE = "Read state is not recorded yet: restart the WhatsApp bridge to update its database."
+
+def _has_read_state(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT COUNT(*) FROM pragma_table_info('chats') WHERE name = 'last_read_at'"
+    ).fetchone()[0] > 0
+
+def _chat_columns(conn: sqlite3.Connection) -> str:
+    return CHAT_COLUMNS + (READ_COLUMNS if _has_read_state(conn) else NO_READ_COLUMNS)
+
 # The latest message per chat, picked deterministically (timestamps have whole-second ties).
 LAST_MESSAGE_JOIN = """
     LEFT JOIN messages m ON m.rowid = (
@@ -528,6 +549,9 @@ def _chat_dict(row: sqlite3.Row, names: _Names, include_last_message: bool = Tru
         "name": names.chat(jid, row["name"]),
         "is_group": jid.endswith(GROUP_SERVER),
         "last_message_time": _local_iso(row["last_message_time"] or row["timestamp"]),
+        "unread_count": row["unread_count"],
+        "marked_unread": bool(row["marked_unread"]),
+        "last_read_time": _local_iso(row["last_read_at"]),
     }
     if include_last_message and row["timestamp"] is not None:
         text = _preview_text(row)
@@ -543,7 +567,8 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    unread_only: bool = False
 ) -> List[Dict[str, Any]]:
     """Get chats matching the specified criteria."""
     if sort_by not in ("last_active", "name"):
@@ -553,16 +578,23 @@ def list_chats(
 
     with _messages_db() as conn:
         names = _Names(conn)
-        sql = f"SELECT {CHAT_COLUMNS} FROM chats c"
+        if unread_only and not _has_read_state(conn):
+            raise WhatsAppError(NO_READ_STATE)
+        sql = f"SELECT {_chat_columns(conn)} FROM chats c"
         sql += LAST_MESSAGE_JOIN if include_last_message else NO_MESSAGE_JOIN
+        where: List[str] = []
         params: List[Any] = []
         if query:
             # Also match people by their address-book name, which chats.name may not carry.
             needle = query.casefold()
             contact_jids = [jid for jid, name in names.contacts.items() if needle in name.casefold()][:500]
             placeholders = ",".join("?" * len(contact_jids))
-            sql += f" WHERE (c.name LIKE ? ESCAPE '\\' OR c.jid LIKE ? ESCAPE '\\' OR c.jid IN ({placeholders}))"
+            where.append(f"(c.name LIKE ? ESCAPE '\\' OR c.jid LIKE ? ESCAPE '\\' OR c.jid IN ({placeholders}))")
             params.extend([_like(query), _like(query)] + contact_jids)
+        if unread_only:
+            where.append("(unread_count > 0 OR c.marked_unread)")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY " + ("c.last_message_time DESC" if sort_by == "last_active" else "c.name COLLATE NOCASE")
         sql += ", c.jid LIMIT ? OFFSET ?"
         params.extend([limit, page * limit])
@@ -572,7 +604,7 @@ def list_chats(
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
     """Get chat metadata by JID."""
     with _messages_db() as conn:
-        sql = f"SELECT {CHAT_COLUMNS} FROM chats c"
+        sql = f"SELECT {_chat_columns(conn)} FROM chats c"
         sql += LAST_MESSAGE_JOIN if include_last_message else NO_MESSAGE_JOIN
         sql += " WHERE c.jid = ?"
         row = conn.execute(sql, (chat_jid.strip(),)).fetchone()
@@ -586,7 +618,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
     digits = _normalize_sender(sender_phone_number)
     with _messages_db() as conn:
         names = _Names(conn)
-        base = f"SELECT {CHAT_COLUMNS} FROM chats c {LAST_MESSAGE_JOIN}"
+        base = f"SELECT {_chat_columns(conn)} FROM chats c {LAST_MESSAGE_JOIN}"
         exact_jid = digits if digits.endswith(LID_SERVER) else digits + USER_SERVER
         row = conn.execute(base + " WHERE c.jid = ?", (exact_jid,)).fetchone()
         if row:
@@ -616,7 +648,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         names = _Names(conn)
         cursor = conn.execute(
             f"""
-            SELECT {CHAT_COLUMNS}
+            SELECT {_chat_columns(conn)}
             FROM chats c
             {LAST_MESSAGE_JOIN}
             WHERE c.jid = ?
@@ -627,6 +659,66 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
             (chat, sender, limit, page * limit),
         )
         return [_chat_dict(row, names) for row in cursor]
+
+
+def get_unread_messages(chat_jid: str, limit: int = 200, context_before: int = 3) -> str:
+    """Get the messages in a chat after the point I last read it, as a transcript."""
+    limit = _clamp(limit, 1, MAX_MESSAGE_LIMIT)
+    context_before = _clamp(context_before, 0, MAX_CONTEXT)
+    chat_jid = chat_jid.strip()
+
+    with _messages_db() as conn:
+        names = _Names(conn)
+        chat = conn.execute(
+            f"SELECT {_chat_columns(conn)} FROM chats c {NO_MESSAGE_JOIN} WHERE c.jid = ?", (chat_jid,)
+        ).fetchone()
+        if not chat:
+            raise WhatsAppError(f"Chat {chat_jid} not found.")
+        if not _has_read_state(conn):
+            raise WhatsAppError(NO_READ_STATE)
+        name = names.chat(chat_jid, chat["name"])
+        if chat["last_read_at"] is None:
+            raise WhatsAppError(
+                f"It is not known yet what has been read in {name}. It becomes known when the chat is next "
+                "read on the phone or replied to. Use list_messages with chat_jid and after instead."
+            )
+        read_until = _local_iso(chat["last_read_at"])
+
+        order = _chat_positions(conn, chat_jid)
+        unread = [r[0] for r in conn.execute(
+            "SELECT rowid FROM messages WHERE chat_jid = ? AND timestamp > ? ORDER BY timestamp ASC, rowid ASC",
+            (chat_jid, chat["last_read_at"]),
+        )]
+        index = {rowid: i for i, rowid in enumerate(order)}
+
+        if not unread:
+            if not chat["marked_unread"]:
+                return f"No unread messages in {name} (read up to {read_until})."
+            # Marked unread by hand with nothing new: show where the conversation stands
+            positions = list(range(max(0, len(order) - max(context_before, 5)), len(order)))
+            header = f"{name} is marked as unread, but has no new messages since {read_until}. The latest messages:"
+            marked = set()
+        else:
+            shown = unread[-limit:]
+            first = index[shown[0]]
+            # Context only helps when the unread part is shown from its start
+            start = first - context_before if len(shown) == len(unread) else first
+            positions = list(range(max(0, start), len(order)))
+            header = (
+                f"{chat['unread_count']} unread message(s) from others in {name} since {read_until}"
+                + (" (also marked as unread)" if chat["marked_unread"] else "")
+                + ". Unread lines start with \"> \"; lines before them are earlier context."
+            )
+            if len(shown) < len(unread):
+                header += f" Showing the newest {len(shown)} of {len(unread)} messages after that point."
+            marked = None
+
+        rows = _fetch_rows(conn, [order[i] for i in positions])
+        entries = [(i, rows[order[i]]) for i in positions if order[i] in rows]
+        if marked is None:
+            unread_set = set(unread)
+            marked = {(row["id"], row["chat_jid"]) for i, row in entries if order[i] in unread_set}
+        return header + "\n" + _format_transcript(names, [(chat_jid, entries)], marked)
 
 
 def search_contacts(query: str) -> List[Dict[str, Any]]:

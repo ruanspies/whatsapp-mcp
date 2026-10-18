@@ -172,12 +172,13 @@ Claude can access the following tools to interact with WhatsApp:
 
 - **search_contacts**: Search for contacts by name or phone number
 - **list_messages**: Retrieve messages with optional filters and context
-- **list_chats**: List available chats with metadata
+- **list_chats**: List available chats with metadata, including how many messages are unread. `unread_only` lists just the chats with something unread
 - **get_chat**: Get information about a specific chat
 - **get_direct_chat_by_contact**: Find a direct chat with a specific contact
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
+- **get_unread_messages**: Show what you haven't read yet in a chat, with a few earlier messages for context
 - **send_message**: Send a WhatsApp message to an existing chat, by phone number or group JID
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient. Only available with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1`
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed). Only available with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1`
@@ -198,6 +199,16 @@ You can send various media types to your WhatsApp contacts:
   - For optimal compatibility, audio files should be in `.ogg` Opus format.
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
   - Without FFmpeg, you can still send raw audio files using the `send_file` tool, but they won't appear as playable voice messages.
+
+### Read and Unread Chats
+
+The bridge records how far you have read each chat on any of your devices, and whether you marked it as unread, so Claude can tell you what you missed. Reading through Claude never marks anything as read on your phone.
+
+- **Where it comes from**: the read notices your phone sends your other devices, "mark as read/unread" from the chat list, and your own replies (replying means you read everything before). When you first link the bridge, WhatsApp also sends the unread count of each chat.
+- **While the bridge is off**: WhatsApp holds the read notices and delivers them when the bridge reconnects.
+- **Not known yet**: `unread_count` is null for a chat until one of the above happens in it. A chat that was already in the database before this feature starts from your last reply in it.
+- **Exact counts from your phone**: re-link the bridge once. Stop it, move `whatsapp-bridge/store/whatsapp.db*` out of the way (keep `messages.db` and `api_token`), remove the old device under Linked Devices on your phone, start the bridge and scan the QR code. Your message history is kept.
+- **Limits**: times are stored to the second, so messages sent in the same second as the one you last read count as read. Counts can differ slightly from your phone's, which also counts some system messages.
 
 #### Media Downloading
 
@@ -224,6 +235,7 @@ By default, just the metadata of the media is stored in the local database. The 
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
 - **"Client outdated (405)" on start**: WhatsApp has stopped accepting the version of the `whatsmeow` library in use. Run `go get go.mau.fi/whatsmeow@latest && go mod tidy` in `whatsapp-bridge` and fix any build errors.
 - **"WhatsApp bridge is not running" from a tool**: Start the bridge (`go run .` in `whatsapp-bridge`) and leave it running.
+- **"mismatching LTHash" in the bridge log**: The bridge's copy of your chat settings is corrupted, so "mark as unread" stops coming through. Re-link the bridge as described under [Read and Unread Chats](#read-and-unread-chats).
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.

@@ -80,11 +80,11 @@ def start(tmp_path, bridge):
 
 
 @pytest.mark.parametrize("env,count,send_tools", [
-    ({}, 10, {"send_message"}),
-    ({"WHATSAPP_MCP_ENABLE_SEND_MEDIA": "1"}, 12, SEND_TOOLS),
-    ({"WHATSAPP_MCP_READ_ONLY": "1"}, 9, set()),
-    ({"WHATSAPP_MCP_READ_ONLY": "1", "WHATSAPP_MCP_ENABLE_SEND_MEDIA": "1"}, 9, set()),
-    ({"WHATSAPP_MCP_READ_ONLY": "0", "WHATSAPP_MCP_ENABLE_SEND_MEDIA": "0"}, 10, {"send_message"}),
+    ({}, 11, {"send_message"}),
+    ({"WHATSAPP_MCP_ENABLE_SEND_MEDIA": "1"}, 13, SEND_TOOLS),
+    ({"WHATSAPP_MCP_READ_ONLY": "1"}, 10, set()),
+    ({"WHATSAPP_MCP_READ_ONLY": "1", "WHATSAPP_MCP_ENABLE_SEND_MEDIA": "1"}, 10, set()),
+    ({"WHATSAPP_MCP_READ_ONLY": "0", "WHATSAPP_MCP_ENABLE_SEND_MEDIA": "0"}, 11, {"send_message"}),
 ])
 def test_registration_modes(start, env, count, send_tools):
     server = start(**env)
@@ -116,6 +116,7 @@ def test_every_tool_over_stdio(start, tmp_path):
         ("get_contact_chats", {"jid": ALICE}, GROUP),
         ("get_last_interaction", {"jid": ALICE}, "[11:06 id=G8]"),
         ("get_message_context", {"message_id": "DUP1", "chat_jid": ALICE}, "> [12:05 id=DUP1] Me: Yes, 12:30"),
+        ("get_unread_messages", {"chat_jid": ALICE}, "> [09:00 id=A3] Alice Smith: Great."),
         ("send_message", {"recipient": ALICE, "message": "hi"}, '"success": true'),
         ("send_file", {"recipient": ALICE, "media_path": str(document)}, '"success": true'),
         ("send_audio_message", {"recipient": ALICE, "media_path": str(note)}, '"success": true'),

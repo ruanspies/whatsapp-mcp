@@ -215,6 +215,13 @@ func (b *Bridge) ingest(ctx context.Context, evt *events.Message) types.JID {
 		return types.EmptyJID
 	}
 
+	// Writing in a chat means everything before it was read
+	if info.IsFromMe {
+		if err := b.store.AdvanceRead(chatJID, info.Timestamp); err != nil {
+			b.logger.Warnf("Failed to store read state: %v", err)
+		}
+	}
+
 	return chat
 }
 
@@ -258,6 +265,8 @@ func (b *Bridge) handleHistorySync(historySync *events.HistorySync) {
 		if chat.User == "" {
 			continue
 		}
+
+		b.applyHistoryReadState(chat, conversation.GetUnreadCount(), conversation.GetMarkedAsUnread())
 
 		// History carries group names directly; contacts come from the contact store
 		if chat.Server == types.GroupServer && conversation.GetName() != "" {

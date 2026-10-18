@@ -24,3 +24,6 @@ claude_desktop_config.json
 whatsapp-bridge/bin/
 
 .DS_Store
+
+# Binary written by "go build" in whatsapp-bridge
+whatsapp-bridge/whatsapp-client

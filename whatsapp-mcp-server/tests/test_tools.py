@@ -37,7 +37,8 @@ def test_default_tool_set():
     names = [tool.name for tool in asyncio.run(main.mcp.list_tools())]
     assert names == [
         "search_contacts", "list_messages", "list_chats", "get_chat", "get_direct_chat_by_contact",
-        "get_contact_chats", "get_last_interaction", "get_message_context", "send_message", "download_media",
+        "get_contact_chats", "get_last_interaction", "get_message_context", "get_unread_messages", "send_message",
+        "download_media",
     ]
 
 
@@ -193,6 +194,7 @@ def test_list_chats(store):
     assert chats[0] == {
         "jid": BOB, "name": "Bob", "is_group": False, "last_message_time": "2026-10-09T18:00:00+02:00",
         "last_message": "Call me when you can", "last_sender": "Bob", "last_is_from_me": False,
+        "unread_count": None, "marked_unread": False, "last_read_time": None,
     }
     assert chats[1]["is_group"] and chats[1]["last_sender"] == "Me" and chats[1]["last_is_from_me"] is True
     assert [c["jid"] for c in call("list_chats", sort_by="name", limit=2, page=1)] == [GROUP, LOOKALIKE]
@@ -200,6 +202,60 @@ def test_list_chats(store):
     assert [c["jid"] for c in call("list_chats", query="alice smith")] == [ALICE]  # address-book name
     assert "last_message" not in call("list_chats", include_last_message=False)[0]
     assert "Invalid sort_by" in error("list_chats", sort_by="jid; DROP TABLE chats")
+
+
+def test_read_state_in_chats(store):
+    chats = {c["jid"]: c for c in call("list_chats")}
+    assert (chats[GROUP]["unread_count"], chats[GROUP]["marked_unread"]) == (3, False)
+    assert chats[GROUP]["last_read_time"] == "2026-10-09T00:30:00+02:00"
+    assert chats[ALICE]["unread_count"] == 1
+    assert (chats[LOOKALIKE]["unread_count"], chats[LOOKALIKE]["marked_unread"]) == (0, True)
+    assert chats[BOB]["unread_count"] is None  # not known yet
+    assert call("get_chat", chat_jid=ALICE)["unread_count"] == 1
+
+    assert [c["jid"] for c in call("list_chats", unread_only=True)] == [GROUP, ALICE, LOOKALIKE]
+    assert [c["jid"] for c in call("list_chats", unread_only=True, query="fam")] == [GROUP]
+
+
+def test_unread_messages(store):
+    transcript = call("get_unread_messages", chat_jid=GROUP, context_before=1)
+    lines = transcript.splitlines()
+    assert lines[0].startswith("3 unread message(s) from others in Family since 2026-10-09T00:30:00+02:00.")
+    assert ids(transcript) == ["G5", "G6", "DUP1", "G8", "G9"]  # one line of context, then everything after
+    unread = [line for line in lines if line.startswith("> ")]
+    assert [line.split("id=")[1].split("]")[0] for line in unread] == ["G6", "DUP1", "G8", "G9"]
+
+    # Too many to show: the newest are kept, without context
+    transcript = call("get_unread_messages", chat_jid=GROUP, limit=2)
+    assert ids(transcript) == ["G8", "G9"] and "Showing the newest 2 of 4" in transcript
+
+    assert call("get_unread_messages", chat_jid=ALICE, context_before=0).count("id=") == 1
+
+    transcript = call("get_unread_messages", chat_jid=LOOKALIKE)
+    assert "marked as unread, but has no new messages" in transcript and ids(transcript) == ["L1"]
+    assert "> " not in transcript
+
+    assert "not known yet" in error("get_unread_messages", chat_jid=BOB)
+    assert "not found" in error("get_unread_messages", chat_jid="nobody@g.us")
+
+
+def test_unread_messages_with_nothing_unread(store):
+    with sqlite3.connect(os.path.join(os.environ["WHATSAPP_MCP_STORE_DIR"], "messages.db")) as conn:
+        conn.execute("UPDATE chats SET last_read_at = '2026-10-10 00:00:00+00:00' WHERE jid = ?", (GROUP,))
+    assert call("get_unread_messages", chat_jid=GROUP) == (
+        "No unread messages in Family (read up to 2026-10-10T02:00:00+02:00)."
+    )
+
+
+def test_database_from_before_read_state(store):
+    with sqlite3.connect(os.path.join(os.environ["WHATSAPP_MCP_STORE_DIR"], "messages.db")) as conn:
+        conn.execute("ALTER TABLE chats DROP COLUMN last_read_at")
+        conn.execute("ALTER TABLE chats DROP COLUMN marked_unread")
+    chat = call("get_chat", chat_jid=GROUP)
+    assert (chat["unread_count"], chat["marked_unread"], chat["last_read_time"]) == (None, False, None)
+    assert len(call("list_chats")) == 4
+    assert "restart the WhatsApp bridge" in error("list_chats", unread_only=True)
+    assert "restart the WhatsApp bridge" in error("get_unread_messages", chat_jid=GROUP)
 
 
 def test_get_chat(store):
@@ -275,6 +331,7 @@ READ_TOOLS = [
     ("search_contacts", {"query": "a"}), ("list_messages", {}), ("list_chats", {}), ("get_chat", {"chat_jid": GROUP}),
     ("get_direct_chat_by_contact", {"sender_phone_number": "27821234567"}), ("get_contact_chats", {"jid": ALICE}),
     ("get_last_interaction", {"jid": ALICE}), ("get_message_context", {"message_id": "G1"}),
+    ("get_unread_messages", {"chat_jid": GROUP}),
 ]
 
 
