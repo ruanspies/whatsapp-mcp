@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -203,6 +204,10 @@ class _Names:
         self._senders: Dict[str, str] = {}
 
     @property
+    def conn(self) -> sqlite3.Connection:
+        return self._conn
+
+    @property
     def contacts(self) -> Dict[str, str]:
         if self._contacts is None:
             self._contacts = _load_contacts()
@@ -293,6 +298,7 @@ def _format_transcript(
     marked: (id, chat_jid) keys to prefix with '> ' (search hits / the context target).
     A '...' line marks a gap where positions are known and not consecutive.
     """
+    polls = _load_polls(names.conn, [(row["id"], row["chat_jid"]) for _, entries in chats for _, row in entries])
     lines: List[str] = []
     for chat_jid, entries in chats:
         if lines:
@@ -319,7 +325,11 @@ def _format_transcript(
             previous_position = position
             who = "Me" if row["is_from_me"] else names.sender(row["sender"])
             mark = "> " if marked and (row["id"], row["chat_jid"]) in marked else ""
-            lines.append(f"{mark}[{clock} id={_display_id(row['id'])}] {who}: {_message_text(row)}")
+            poll = polls.get((row["id"], row["chat_jid"]))
+            if poll:
+                lines.append(f"{mark}[{clock} id={_display_id(row['id'])}] {who}: {_poll_lines(poll)}")
+            else:
+                lines.append(f"{mark}[{clock} id={_display_id(row['id'])}] {who}: {_message_text(row)}")
     return "\n".join(lines)
 
 def _chat_positions(conn: sqlite3.Connection, chat_jid: str) -> List[int]:
@@ -721,6 +731,189 @@ def get_unread_messages(chat_jid: str, limit: int = 200, context_before: int = 3
         return header + "\n" + _format_transcript(names, [(chat_jid, entries)], marked)
 
 
+# ---------------------------------------------------------------------------
+# Polls
+# ---------------------------------------------------------------------------
+
+# Votes name the options they chose by the SHA-256 hash of the option text; a vote
+# holds the voter's whole current choice, and an empty one means they withdrew it.
+ADDED_LATER = "(an option added after the poll was sent)"
+POLL_NOTE = "Only votes the bridge has seen are counted: those cast while it was linked, and those history brought."
+
+def _has_polls(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'poll_votes'"
+    ).fetchone()[0] > 0
+
+def _load_polls(conn: sqlite3.Connection, keys: List[Tuple[str, str]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """The polls among the given (message id, chat) keys, each with its votes."""
+    if not keys or not _has_polls(conn):
+        return {}
+    polls: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    keys = list(dict.fromkeys(keys))
+    for start in range(0, len(keys), 400):
+        chunk = keys[start:start + 400]
+        condition = " OR ".join("(message_id = ? AND chat_jid = ?)" for _ in chunk)
+        params = [value for key in chunk for value in key]
+        for row in conn.execute(
+            f"SELECT message_id, chat_jid, question, options, selectable_count FROM polls WHERE {condition}", params
+        ):
+            try:
+                options = [str(option) for option in json.loads(row["options"] or "[]")]
+            except ValueError:
+                options = []
+            polls[(row["message_id"], row["chat_jid"])] = {
+                "question": row["question"] or "",
+                "options": options,
+                "selectable": row["selectable_count"] or 0,
+                "votes": [],
+            }
+    found = list(polls)
+    for start in range(0, len(found), 400):
+        chunk = found[start:start + 400]
+        condition = " OR ".join("(poll_id = ? AND chat_jid = ?)" for _ in chunk)
+        params = [value for key in chunk for value in key]
+        for row in conn.execute(
+            f"SELECT poll_id, chat_jid, voter, selected, voted_at, is_from_me FROM poll_votes WHERE {condition} "
+            "ORDER BY voted_at, voter",
+            params,
+        ):
+            try:
+                selected = [str(h) for h in json.loads(row["selected"] or "[]")]
+            except ValueError:
+                selected = []
+            polls[(row["poll_id"], row["chat_jid"])]["votes"].append({
+                "voter": row["voter"],
+                "is_from_me": bool(row["is_from_me"]),
+                "selected": selected,
+                "voted_at": row["voted_at"],
+            })
+    return polls
+
+def _option_hash(option: str) -> str:
+    return hashlib.sha256(option.encode("utf-8")).hexdigest()
+
+def _vote_choices(poll: Dict[str, Any], vote: Dict[str, Any]) -> List[str]:
+    by_hash = {_option_hash(option): option for option in poll["options"]}
+    return [by_hash.get(h.lower(), ADDED_LATER) for h in vote["selected"]]
+
+def _tally(poll: Dict[str, Any]) -> Tuple[List[Tuple[str, List[Dict[str, Any]]]], int]:
+    """Each option with the votes that chose it (options added later last), and how many people voted."""
+    chosen: Dict[str, List[Dict[str, Any]]] = {option: [] for option in poll["options"]}
+    voters = 0
+    for vote in poll["votes"]:
+        choices = _vote_choices(poll, vote)
+        if choices:
+            voters += 1
+        for choice in dict.fromkeys(choices):
+            chosen.setdefault(choice, []).append(vote)
+    return list(chosen.items()), voters
+
+def _choose_text(selectable: int, option_count: int) -> str:
+    if selectable == 1:
+        return "choose one"
+    if selectable <= 0 or selectable >= option_count:
+        return "choose any"
+    return f"choose up to {selectable}"
+
+def _poll_lines(poll: Dict[str, Any]) -> str:
+    """A poll in a transcript: the question, then one indented line per option with its count."""
+    tally, voters = _tally(poll)
+    lines = [f"📊 Poll: {_one_line(poll['question'])} ({_choose_text(poll['selectable'], len(poll['options']))})"]
+    for option, votes in tally:
+        lines.append(f"    • {_one_line(option)}: {len(votes)}")
+    lines.append(f"    ({voters} voted)")
+    return "\n".join(lines)
+
+def _voter_name(names: _Names, vote: Dict[str, Any]) -> str:
+    return "Me" if vote["is_from_me"] else names.sender(vote["voter"])
+
+def get_poll_results(chat_jid: str, message_id: str) -> Dict[str, Any]:
+    """Get a poll's question, options and who voted for what."""
+    chat_jid = chat_jid.strip()
+    with _messages_db() as conn:
+        polls = _load_polls(conn, [(message_id, chat_jid)])
+        poll = polls.get((message_id, chat_jid))
+        if not poll:
+            if not _has_polls(conn):
+                raise WhatsAppError("Polls are not recorded yet: restart the WhatsApp bridge to update its database.")
+            raise WhatsAppError(f"No poll with ID {message_id} in chat {chat_jid}.")
+        names = _Names(conn)
+        message = conn.execute(
+            f"SELECT {MESSAGE_COLUMNS} FROM messages m LEFT JOIN chats c ON c.jid = m.chat_jid "
+            "WHERE m.id = ? AND m.chat_jid = ?",
+            (message_id, chat_jid),
+        ).fetchone()
+        tally, voters = _tally(poll)
+        mine = next((vote for vote in poll["votes"] if vote["is_from_me"]), None)
+        result: Dict[str, Any] = {
+            "question": poll["question"],
+            "chat": names.chat(chat_jid, message["chat_name"] if message else None),
+            "chat_jid": chat_jid,
+            "message_id": message_id,
+            "choose": _choose_text(poll["selectable"], len(poll["options"])).replace("choose ", ""),
+            "options": [
+                {"option": option, "count": len(votes), "voters": [_voter_name(names, v) for v in votes]}
+                for option, votes in tally
+            ],
+            "people_voted": voters,
+            "my_choice": _vote_choices(poll, mine) if mine and mine["selected"] else None,
+            "votes": [
+                {
+                    "voter": _voter_name(names, vote),
+                    "choice": _vote_choices(poll, vote),
+                    "voted_at": _local_iso(vote["voted_at"]),
+                }
+                for vote in poll["votes"]
+            ],
+            "note": POLL_NOTE + " A vote with an empty choice was withdrawn.",
+        }
+        if message:
+            result["sent_by"] = "Me" if message["is_from_me"] else names.sender(message["sender"])
+            result["sent_at"] = _local_iso(message["timestamp"])
+        return result
+
+def list_polls(chat_jid: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    """Get recent polls, newest first, with how many voted, what leads and whether I voted."""
+    limit = _clamp(limit, 1, MAX_CHAT_LIMIT)
+    with _messages_db() as conn:
+        if not _has_polls(conn):
+            raise WhatsAppError("Polls are not recorded yet: restart the WhatsApp bridge to update its database.")
+        sql = (
+            f"SELECT {MESSAGE_COLUMNS} FROM polls p "
+            "JOIN messages m ON m.id = p.message_id AND m.chat_jid = p.chat_jid "
+            "LEFT JOIN chats c ON c.jid = m.chat_jid"
+        )
+        params: List[Any] = []
+        if chat_jid:
+            sql += " WHERE m.chat_jid = ?"
+            params.append(chat_jid.strip())
+        sql += " ORDER BY m.timestamp DESC, m.rowid DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        polls = _load_polls(conn, [(row["id"], row["chat_jid"]) for row in rows])
+        names = _Names(conn)
+        result = []
+        for row in rows:
+            poll = polls[(row["id"], row["chat_jid"])]
+            tally, voters = _tally(poll)
+            top = max((len(votes) for _, votes in tally), default=0)
+            leading = [option for option, votes in tally if top and len(votes) == top]
+            result.append({
+                "chat": names.chat(row["chat_jid"], row["chat_name"]),
+                "chat_jid": row["chat_jid"],
+                "message_id": row["id"],
+                "question": poll["question"],
+                "sent_by": "Me" if row["is_from_me"] else names.sender(row["sender"]),
+                "sent_at": _local_iso(row["timestamp"]),
+                "people_voted": voters,
+                "leading": leading,
+                "leading_votes": top,
+                "i_voted": any(vote["is_from_me"] and vote["selected"] for vote in poll["votes"]),
+            })
+        return result
+
+
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search people by name or phone number, across direct chats and the WhatsApp address book."""
     query = (query or "").strip()
@@ -830,6 +1023,26 @@ def send_message(recipient: str, message: str) -> Dict[str, Any]:
     if not message:
         return _failure("Message must be provided")
     return _send_result(_bridge_post("send", {"recipient": recipient, "message": message}, SEND_TIMEOUT))
+
+def send_poll(recipient: str, question: str, options: List[str], multiple_answers: bool = False) -> Dict[str, Any]:
+    """Ask the bridge to send a poll; it checks the question and options against WhatsApp's limits."""
+    if not recipient:
+        return _failure("Recipient must be provided")
+    if not question or not question.strip():
+        return _failure("Question must be provided")
+    if not isinstance(options, list) or not all(isinstance(option, str) for option in options):
+        return _failure("Options must be a list of texts")
+    payload = {
+        "recipient": recipient,
+        "question": question,
+        "options": options,
+        "multiple_answers": bool(multiple_answers),
+    }
+    result = _bridge_post("send_poll", payload, SEND_TIMEOUT)
+    sent = _send_result(result)
+    if result["success"] and result.get("message_id"):
+        sent["message_id"] = str(result["message_id"])
+    return sent
 
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     if not recipient:

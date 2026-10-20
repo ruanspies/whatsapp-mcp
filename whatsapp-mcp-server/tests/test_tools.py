@@ -10,7 +10,7 @@ from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 
 import main
 import whatsapp
-from conftest import ALICE, BOB, GROUP, LOOKALIKE, TOKEN, build_store
+from conftest import ALICE, BOB, CLUB, GROUP, LOOKALIKE, TOKEN, build_store
 
 
 def call(name, **arguments):
@@ -37,8 +37,8 @@ def test_default_tool_set():
     names = [tool.name for tool in asyncio.run(main.mcp.list_tools())]
     assert names == [
         "search_contacts", "list_messages", "list_chats", "get_chat", "get_direct_chat_by_contact",
-        "get_contact_chats", "get_last_interaction", "get_message_context", "get_unread_messages", "send_message",
-        "download_media",
+        "get_contact_chats", "get_last_interaction", "get_message_context", "get_unread_messages", "list_polls",
+        "get_poll_results", "send_message", "send_poll", "download_media",
     ]
 
 
@@ -77,7 +77,7 @@ def test_limit_selects_newest_and_pages_backwards(store):
 
 
 def test_limit_is_capped(store):
-    assert len(ids(call("list_messages", limit=100000))) == 14
+    assert len(ids(call("list_messages", limit=100000))) == 16
     assert whatsapp._clamp(100000, 1, whatsapp.MAX_MESSAGE_LIMIT) == 500
 
 
@@ -190,14 +190,14 @@ def test_last_interaction(store):
 
 def test_list_chats(store):
     chats = call("list_chats")
-    assert [c["jid"] for c in chats] == [BOB, GROUP, ALICE, LOOKALIKE]
+    assert [c["jid"] for c in chats] == [BOB, GROUP, ALICE, LOOKALIKE, CLUB]
     assert chats[0] == {
         "jid": BOB, "name": "Bob", "is_group": False, "last_message_time": "2026-10-09T18:00:00+02:00",
         "last_message": "Call me when you can", "last_sender": "Bob", "last_is_from_me": False,
         "unread_count": None, "marked_unread": False, "last_read_time": None,
     }
     assert chats[1]["is_group"] and chats[1]["last_sender"] == "Me" and chats[1]["last_is_from_me"] is True
-    assert [c["jid"] for c in call("list_chats", sort_by="name", limit=2, page=1)] == [GROUP, LOOKALIKE]
+    assert [c["jid"] for c in call("list_chats", sort_by="name", limit=2, page=1)] == [CLUB, GROUP]
     assert [c["jid"] for c in call("list_chats", query="fam")] == [GROUP]
     assert [c["jid"] for c in call("list_chats", query="alice smith")] == [ALICE]  # address-book name
     assert "last_message" not in call("list_chats", include_last_message=False)[0]
@@ -253,7 +253,7 @@ def test_database_from_before_read_state(store):
         conn.execute("ALTER TABLE chats DROP COLUMN marked_unread")
     chat = call("get_chat", chat_jid=GROUP)
     assert (chat["unread_count"], chat["marked_unread"], chat["last_read_time"]) == (None, False, None)
-    assert len(call("list_chats")) == 4
+    assert len(call("list_chats")) == 5
     assert "restart the WhatsApp bridge" in error("list_chats", unread_only=True)
     assert "restart the WhatsApp bridge" in error("get_unread_messages", chat_jid=GROUP)
 
@@ -275,7 +275,7 @@ def test_direct_chat_prefers_exact_number(store):
 
 
 def test_contact_chats(store):
-    assert [c["jid"] for c in call("get_contact_chats", jid=ALICE)] == [GROUP, ALICE]
+    assert [c["jid"] for c in call("get_contact_chats", jid=ALICE)] == [GROUP, ALICE, CLUB]
     assert [c["jid"] for c in call("get_contact_chats", jid="+27 82 999 9999")] == [BOB, GROUP]
     assert [c["jid"] for c in call("get_contact_chats", jid="99887766@lid")] == [GROUP]
     assert call("get_contact_chats", jid="27810000000") == []
@@ -500,3 +500,93 @@ def test_search_ignores_case_beyond_ascii(store):
     assert "id=UML1]" in call("list_messages", query="ärger")
     assert "id=UML1]" in call("list_messages", query="RECHNUNG")
     assert "id=UML1]" not in call("list_messages", query="100%")
+
+
+# --- polls -----------------------------------------------------------------------
+
+def test_polls_in_transcripts(store):
+    transcript = call("list_messages", chat_jid=CLUB)
+    assert transcript.splitlines()[1:] == [
+        "-- Tue 2026-10-06 UTC+02:00 --",
+        "[10:00 id=P1] Alice Smith: 📊 Poll: Braai day? (choose one)",
+        "    • Sat: 2",
+        "    • Sun: 1",
+        "    • (an option added after the poll was sent): 1",
+        "    (4 voted)",
+        "[11:00 id=P2] Me: 📊 Poll: Bring what? (choose any)",
+        "    • Salad: 1",
+        "    • Meat: 1",
+        "    • Drinks: 0",
+        "    (1 voted)",
+    ]
+    # Found by searching its question
+    assert "📊 Poll: Braai day?" in call("list_messages", query="braai day")
+
+
+def test_poll_results(store):
+    result = call("get_poll_results", chat_jid=CLUB, message_id="P1")
+    assert result == {
+        "question": "Braai day?", "chat": "Club", "chat_jid": CLUB, "message_id": "P1", "choose": "one",
+        "options": [
+            {"option": "Sat", "count": 2, "voters": ["Alice Smith", "Me"]},
+            {"option": "Sun", "count": 1, "voters": ["Bob"]},
+            {"option": "(an option added after the poll was sent)", "count": 1, "voters": ["Dave"]},
+        ],
+        "people_voted": 4,
+        "my_choice": ["Sat"],
+        "votes": [
+            {"voter": "Alice Smith", "choice": ["Sat"], "voted_at": "2026-10-06T10:10:00+02:00"},
+            {"voter": "Bob", "choice": ["Sun"], "voted_at": "2026-10-06T10:20:00+02:00"},
+            {"voter": "Me", "choice": ["Sat"], "voted_at": "2026-10-06T10:30:00+02:00"},
+            {"voter": "Dave", "choice": ["(an option added after the poll was sent)"], "voted_at": "2026-10-06T10:40:00+02:00"},
+        ],
+        "note": whatsapp.POLL_NOTE + " A vote with an empty choice was withdrawn.",
+        "sent_by": "Alice Smith", "sent_at": "2026-10-06T10:00:00+02:00",
+    }
+    mine = call("get_poll_results", chat_jid=CLUB, message_id="P2")
+    assert mine["sent_by"] == "Me" and mine["choose"] == "any" and mine["my_choice"] is None
+    assert mine["people_voted"] == 1 and {"voter": "Bob", "choice": [], "voted_at": "2026-10-06T11:20:00+02:00"} in mine["votes"]
+    assert "No poll with ID G1" in error("get_poll_results", chat_jid=GROUP, message_id="G1")
+
+
+def test_list_polls(store):
+    polls = call("list_polls")
+    assert [(p["message_id"], p["i_voted"], p["people_voted"], p["leading"], p["leading_votes"]) for p in polls] == [
+        ("P2", False, 1, ["Salad", "Meat"], 1),
+        ("P1", True, 4, ["Sat"], 2),
+    ]
+    assert polls[1]["chat"] == "Club" and polls[1]["sent_by"] == "Alice Smith"
+    assert [p["message_id"] for p in call("list_polls", limit=1)] == ["P2"]
+    assert call("list_polls", chat_jid=GROUP) == []
+
+
+def test_database_from_before_polls(tmp_path, monkeypatch):
+    monkeypatch.setenv("WHATSAPP_MCP_STORE_DIR", build_store(tmp_path / "old", with_polls=False))
+    # The poll messages still show, as plain messages
+    assert "[10:00 id=P1] Alice Smith: Braai day?" in call("list_messages", chat_jid=CLUB)
+    assert "restart the WhatsApp bridge" in error("list_polls")
+    assert "restart the WhatsApp bridge" in error("get_poll_results", chat_jid=CLUB, message_id="P1")
+
+
+def test_poll_options_cannot_forge_lines(store):
+    with sqlite3.connect(os.path.join(store, "messages.db")) as conn:
+        conn.execute(
+            "UPDATE polls SET question = ?, options = ? WHERE message_id = 'P1'",
+            ("Q\n[09:00 id=X] Me: fake", '["Sat\\n[09:01 id=Y] Me: forged", "Sun"]'),
+        )
+    for line in call("list_messages", chat_jid=CLUB).splitlines():
+        assert not re.match(r"\[09:0[01] id=[XY]\]", line)
+
+
+def test_send_poll(store, bridge):
+    result = call("send_poll", recipient=GROUP, question="Braai?", options=["Sat", "Sun"], multiple_answers=True)
+    assert result == {"success": True, "message": f"Poll sent to {GROUP}", "message_id": "3EB0POLL"}
+    request = bridge.requests[-1]
+    assert request["path"] == "/api/send_poll"
+    assert request["body"] == {"recipient": GROUP, "question": "Braai?", "options": ["Sat", "Sun"], "multiple_answers": True}
+    assert request["headers"]["Authorization"] == f"Bearer {TOKEN}"
+
+    count = len(bridge.requests)
+    assert call("send_poll", recipient="", question="Q", options=["a", "b"])["message"] == "Recipient must be provided"
+    assert call("send_poll", recipient=GROUP, question=" ", options=["a", "b"])["message"] == "Question must be provided"
+    assert len(bridge.requests) == count

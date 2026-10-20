@@ -187,8 +187,21 @@ func (b *Bridge) ingest(ctx context.Context, evt *events.Message) types.JID {
 		return types.EmptyJID
 	}
 
+	// A vote changes a poll's results and is not itself a message
+	if msg.GetPollUpdateMessage() != nil {
+		b.ingestVote(ctx, evt, chatJID, sender)
+		return types.EmptyJID
+	}
+
 	content := extractTextContent(msg)
 	media := extractMediaInfo(msg)
+	poll := pollCreation(msg)
+	if poll != nil {
+		content = poll.GetName()
+		if content == "" {
+			content = "(poll without a question)"
+		}
+	}
 
 	// Skip if there's no content and no media
 	if content == "" && media.Type == "" {
@@ -213,6 +226,20 @@ func (b *Bridge) ingest(ctx context.Context, evt *events.Message) types.JID {
 	if err != nil {
 		b.logger.Warnf("Failed to store message: %v", err)
 		return types.EmptyJID
+	}
+
+	if poll != nil {
+		err := b.store.StorePoll(StoredPoll{
+			MessageID: info.ID, ChatJID: chatJID, Sender: sender, IsFromMe: info.IsFromMe,
+			Question: poll.GetName(), Options: pollOptions(poll), SelectableCount: poll.GetSelectableOptionsCount(),
+		})
+		if err != nil {
+			b.logger.Warnf("Failed to store poll: %v", err)
+		}
+		// History brings the votes cast so far along with the poll
+		if evt.SourceWebMsg != nil {
+			b.ingestHistoryVotes(ctx, evt.SourceWebMsg, chat, info.ID, info.Timestamp)
+		}
 	}
 
 	// Writing in a chat means everything before it was read

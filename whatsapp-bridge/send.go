@@ -205,6 +205,53 @@ func (b *Bridge) sendWhatsAppMessage(ctx context.Context, chatJID string, messag
 	return nil
 }
 
+// sendPoll sends a poll to a chat that passed checkRecipient and returns its message ID
+func (b *Bridge) sendPoll(ctx context.Context, chatJID, question string, options []string, multipleAnswers bool) (string, *apiError) {
+	if !b.client.IsConnected() {
+		return "", refuse(http.StatusServiceUnavailable, "Not connected to WhatsApp")
+	}
+
+	recipientJID, err := types.ParseJID(chatJID)
+	if err != nil {
+		return "", refuse(http.StatusBadRequest, "Error parsing JID: %v", err)
+	}
+
+	// 0 lets people pick any number of options
+	selectable := 1
+	if multipleAnswers {
+		selectable = 0
+	}
+	resp, err := b.client.SendMessage(ctx, recipientJID, b.client.BuildPollCreation(question, options, selectable))
+	if err != nil {
+		return "", refuse(http.StatusInternalServerError, "Error sending poll: %v", err)
+	}
+
+	// WhatsApp does not echo a device's own messages back to it, so record the poll here
+	b.storeLock.Lock()
+	defer b.storeLock.Unlock()
+	if err := b.store.StoreChat(chatJID, recipientJID.User, resp.Timestamp); err != nil {
+		b.logger.Warnf("Failed to store chat: %v", err)
+	}
+	sender := ""
+	if b.client.Store.ID != nil {
+		sender = b.client.Store.ID.User
+	}
+	err = b.store.StoreMessage(StoredMessage{
+		ID: resp.ID, ChatJID: chatJID, Sender: sender, Content: question, Timestamp: resp.Timestamp, IsFromMe: true,
+	})
+	if err == nil {
+		err = b.store.StorePoll(StoredPoll{
+			MessageID: resp.ID, ChatJID: chatJID, Sender: sender, IsFromMe: true,
+			Question: question, Options: options, SelectableCount: uint32(selectable),
+		})
+	}
+	if err != nil {
+		b.logger.Warnf("Failed to store sent poll: %v", err)
+	}
+
+	return resp.ID, nil
+}
+
 // resolvePath makes a path absolute and follows the symbolic links in it. Parts
 // that do not exist yet are kept as they are, after resolving what does exist.
 func resolvePath(path string) (string, error) {

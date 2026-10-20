@@ -2,6 +2,8 @@ package main
 
 import (
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -96,6 +98,25 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		CREATE INDEX IF NOT EXISTS messages_chat_time ON messages (chat_jid, timestamp);
 		CREATE INDEX IF NOT EXISTS messages_time ON messages (timestamp);
 		CREATE INDEX IF NOT EXISTS messages_sender ON messages (sender);
+
+		CREATE TABLE IF NOT EXISTS polls (
+			message_id TEXT,
+			chat_jid TEXT,
+			question TEXT,
+			options TEXT,
+			selectable_count INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (message_id, chat_jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS poll_votes (
+			poll_id TEXT,
+			chat_jid TEXT,
+			voter TEXT,
+			selected TEXT,
+			voted_at TIMESTAMP,
+			is_from_me BOOLEAN NOT NULL DEFAULT 0,
+			PRIMARY KEY (poll_id, chat_jid, voter)
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -366,10 +387,21 @@ func (store *MessageStore) UpdateMessageContent(id, chatJID, sender string, isFr
 	return err
 }
 
-// DeleteMessage removes a message that its own sender deleted for everyone
+// DeleteMessage removes a message that its own sender deleted for everyone,
+// together with the poll and votes if it was a poll
 func (store *MessageStore) DeleteMessage(id, chatJID, sender string, isFromMe bool) error {
-	_, err := store.db.Exec("DELETE FROM messages WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = ?",
+	result, err := store.db.Exec("DELETE FROM messages WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = ?",
 		id, chatJID, sender, isFromMe)
+	if err != nil {
+		return err
+	}
+	if deleted, err := result.RowsAffected(); err != nil || deleted == 0 {
+		return err
+	}
+	if _, err := store.db.Exec("DELETE FROM polls WHERE message_id = ? AND chat_jid = ?", id, chatJID); err != nil {
+		return err
+	}
+	_, err = store.db.Exec("DELETE FROM poll_votes WHERE poll_id = ? AND chat_jid = ?", id, chatJID)
 	return err
 }
 
@@ -424,7 +456,8 @@ func (store *MessageStore) HiddenChats() ([]string, error) {
 
 // HiddenSenders lists senders still stored under a hidden (@lid) address
 func (store *MessageStore) HiddenSenders() ([]string, error) {
-	return store.queryStrings("SELECT DISTINCT sender FROM messages WHERE sender LIKE '%@lid'")
+	return store.queryStrings(
+		"SELECT sender FROM messages WHERE sender LIKE '%@lid' UNION SELECT voter FROM poll_votes WHERE voter LIKE '%@lid'")
 }
 
 // MergeChat moves every message of one chat into another and removes the first.
@@ -462,12 +495,14 @@ func (store *MessageStore) MergeChat(fromJID, toJID, fallbackName string) error 
 		return err
 	}
 
-	// Messages already present in the target win over their copies
-	if _, err = tx.Exec("UPDATE OR IGNORE messages SET chat_jid = ? WHERE chat_jid = ?", toJID, fromJID); err != nil {
-		return err
-	}
-	if _, err = tx.Exec("DELETE FROM messages WHERE chat_jid = ?", fromJID); err != nil {
-		return err
+	// Messages, polls and votes already present in the target win over their copies
+	for _, table := range []string{"messages", "polls", "poll_votes"} {
+		if _, err = tx.Exec("UPDATE OR IGNORE "+table+" SET chat_jid = ? WHERE chat_jid = ?", toJID, fromJID); err != nil {
+			return err
+		}
+		if _, err = tx.Exec("DELETE FROM "+table+" WHERE chat_jid = ?", fromJID); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.Exec("DELETE FROM chats WHERE jid = ?", fromJID); err != nil {
 		return err
@@ -476,8 +511,81 @@ func (store *MessageStore) MergeChat(fromJID, toJID, fallbackName string) error 
 	return tx.Commit()
 }
 
-// RenameSender rewrites the sender of every message from one identity to another
+// RenameSender rewrites the sender of every message, and the voter of every
+// vote, from one identity to another
 func (store *MessageStore) RenameSender(from, to string) error {
-	_, err := store.db.Exec("UPDATE messages SET sender = ? WHERE sender = ?", to, from)
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err = tx.Exec("UPDATE messages SET sender = ? WHERE sender = ?", to, from); err != nil {
+		return err
+	}
+	// Where both identities voted on the same poll, the newer vote is kept
+	_, err = tx.Exec(
+		`DELETE FROM poll_votes WHERE voter = ? AND EXISTS (
+			SELECT 1 FROM poll_votes newer WHERE newer.poll_id = poll_votes.poll_id AND newer.chat_jid = poll_votes.chat_jid
+			AND newer.voter = ? AND newer.voted_at > poll_votes.voted_at)`,
+		from, to,
+	)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec("UPDATE OR REPLACE poll_votes SET voter = ? WHERE voter = ?", to, from); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// StoredPoll is a poll that was sent as a message
+type StoredPoll struct {
+	MessageID       string
+	ChatJID         string
+	Sender          string
+	IsFromMe        bool
+	Question        string
+	Options         []string
+	SelectableCount uint32
+}
+
+// StorePoll stores the question and options of a poll whose message is already
+// stored, and only when the poll comes from that message's own sender
+func (store *MessageStore) StorePoll(poll StoredPoll) error {
+	options, err := json.Marshal(poll.Options)
+	if err != nil {
+		return err
+	}
+	_, err = store.db.Exec(
+		`INSERT INTO polls (message_id, chat_jid, question, options, selectable_count)
+		SELECT ?, ?, ?, ?, ? WHERE EXISTS (
+			SELECT 1 FROM messages WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = ?)
+		ON CONFLICT(message_id, chat_jid) DO UPDATE SET
+			question = excluded.question, options = excluded.options, selectable_count = excluded.selectable_count`,
+		poll.MessageID, poll.ChatJID, poll.Question, string(options), poll.SelectableCount,
+		poll.MessageID, poll.ChatJID, poll.Sender, poll.IsFromMe,
+	)
+	return err
+}
+
+// StoreVote records someone's current choice in a poll: the SHA-256 hashes of
+// the options they selected, none when they withdrew their vote. A vote only
+// replaces one cast at the same time or earlier, so late history cannot undo it.
+func (store *MessageStore) StoreVote(pollID, chatJID, voter string, isFromMe bool, selected [][]byte, votedAt time.Time) error {
+	hashes := make([]string, len(selected))
+	for i, hash := range selected {
+		hashes[i] = hex.EncodeToString(hash)
+	}
+	encoded, err := json.Marshal(hashes)
+	if err != nil {
+		return err
+	}
+	_, err = store.db.Exec(
+		`INSERT INTO poll_votes (poll_id, chat_jid, voter, selected, voted_at, is_from_me) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(poll_id, chat_jid, voter) DO UPDATE SET selected = excluded.selected, voted_at = excluded.voted_at
+		WHERE excluded.voted_at >= poll_votes.voted_at`,
+		pollID, chatJID, voter, string(encoded), formatTimestamp(votedAt), isFromMe,
+	)
 	return err
 }

@@ -44,6 +44,7 @@ func (b *Bridge) testServer() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/send", b.guard(b.handleSend))
 	mux.HandleFunc("/api/download", b.guard(b.handleDownload))
+	mux.HandleFunc("/api/send_poll", b.guard(b.handleSendPoll))
 	return mux
 }
 

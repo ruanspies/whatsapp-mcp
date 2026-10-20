@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
 )
@@ -27,6 +28,8 @@ type APIResponse struct {
 	Message  string `json:"message"`
 	Filename string `json:"filename,omitempty"`
 	Path     string `json:"path,omitempty"`
+	// MessageID is set when a poll was sent, so its results can be asked for later
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -35,6 +38,22 @@ type SendMessageRequest struct {
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
 }
+
+// SendPollRequest is the request body for the send poll API
+type SendPollRequest struct {
+	Recipient       string   `json:"recipient"`
+	Question        string   `json:"question"`
+	Options         []string `json:"options"`
+	MultipleAnswers bool     `json:"multiple_answers"`
+}
+
+// Limits of the WhatsApp apps
+const (
+	maxPollQuestion = 255
+	maxPollOption   = 100
+	minPollOptions  = 2
+	maxPollOptions  = 12
+)
 
 // DownloadMediaRequest represents the request body for the download media API
 type DownloadMediaRequest struct {
@@ -152,7 +171,20 @@ func (b *Bridge) checkSendAllowed(req SendMessageRequest) (string, *apiError) {
 		return "", refuse(http.StatusForbidden, "Sending files is disabled. Set WHATSAPP_MCP_ENABLE_SEND_MEDIA=1 for the bridge and the MCP server to enable it")
 	}
 
-	recipient, err := normalizeRecipient(req.Recipient)
+	return b.checkRecipient(req.Recipient)
+}
+
+// checkRecipient applies the rules every kind of message shares and returns the chat to send to
+func (b *Bridge) checkRecipient(recipientText string) (string, *apiError) {
+	if b.cfg.ReadOnly {
+		return "", refuse(http.StatusForbidden, "Sending is disabled: the bridge is running in read-only mode")
+	}
+
+	if strings.TrimSpace(recipientText) == "" {
+		return "", refuse(http.StatusBadRequest, "Recipient is required")
+	}
+
+	recipient, err := normalizeRecipient(recipientText)
 	if err != nil {
 		return "", refuse(http.StatusBadRequest, "Invalid recipient: %v", err)
 	}
@@ -192,6 +224,64 @@ func (b *Bridge) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: fmt.Sprintf("Message sent to %s", chatJID)})
+}
+
+// checkPoll trims a poll's question and options and checks them against WhatsApp's limits
+func checkPoll(req *SendPollRequest) *apiError {
+	req.Question = strings.TrimSpace(req.Question)
+	if req.Question == "" {
+		return refuse(http.StatusBadRequest, "Question is required")
+	}
+	if utf8.RuneCountInString(req.Question) > maxPollQuestion {
+		return refuse(http.StatusBadRequest, "Question is longer than %d characters", maxPollQuestion)
+	}
+	if len(req.Options) < minPollOptions || len(req.Options) > maxPollOptions {
+		return refuse(http.StatusBadRequest, "A poll needs between %d and %d options", minPollOptions, maxPollOptions)
+	}
+	// Votes name options by a hash of their text, so two equal options could not be told apart
+	seen := make(map[string]bool, len(req.Options))
+	for i, option := range req.Options {
+		option = strings.TrimSpace(option)
+		if option == "" {
+			return refuse(http.StatusBadRequest, "Option %d is empty", i+1)
+		}
+		if utf8.RuneCountInString(option) > maxPollOption {
+			return refuse(http.StatusBadRequest, "Option %d is longer than %d characters", i+1, maxPollOption)
+		}
+		if seen[option] {
+			return refuse(http.StatusBadRequest, "Option %q appears more than once", option)
+		}
+		seen[option] = true
+		req.Options[i] = option
+	}
+	return nil
+}
+
+// Handler for sending polls
+func (b *Bridge) handleSendPoll(w http.ResponseWriter, r *http.Request) {
+	var req SendPollRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, refuse(http.StatusBadRequest, "Invalid request format"))
+		return
+	}
+
+	chatJID, refusal := b.checkRecipient(req.Recipient)
+	if refusal != nil {
+		writeError(w, refusal)
+		return
+	}
+	if refusal := checkPoll(&req); refusal != nil {
+		writeError(w, refusal)
+		return
+	}
+
+	messageID, refusal := b.sendPoll(r.Context(), chatJID, req.Question, req.Options, req.MultipleAnswers)
+	if refusal != nil {
+		writeError(w, refusal)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: fmt.Sprintf("Poll sent to %s", chatJID), MessageID: messageID})
 }
 
 // Handler for downloading media
@@ -461,6 +551,7 @@ func (b *Bridge) startRESTServer() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/send", b.guard(b.handleSend))
 	mux.HandleFunc("/api/download", b.guard(b.handleDownload))
+	mux.HandleFunc("/api/send_poll", b.guard(b.handleSendPoll))
 
 	// Listen on the loopback interface only, so nothing else on the network can reach the API
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", b.cfg.Port)

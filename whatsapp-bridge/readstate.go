@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.mau.fi/whatsmeow/appstate"
@@ -105,7 +106,14 @@ func unixTime(value int64) time.Time {
 // not always do for changes made while this device was offline.
 func (b *Bridge) catchUpAppState(ctx context.Context) {
 	for _, name := range appstate.AllPatchNames {
-		if err := b.client.FetchAppState(ctx, name, false, false); err != nil {
+		err := b.client.FetchAppState(ctx, name, false, false)
+		if errors.Is(err, appstate.ErrMismatchingLTHash) {
+			// The stored copy no longer matches WhatsApp's, so a change was missed.
+			// Downloading the settings again from scratch repairs it.
+			b.logger.Infof("Chat settings %s are out of step with WhatsApp; downloading them again", name)
+			err = b.client.FetchAppState(ctx, name, true, false)
+		}
+		if err != nil {
 			b.logger.Warnf("Failed to catch up on %s chat settings: %v", name, err)
 		}
 	}

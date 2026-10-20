@@ -157,7 +157,7 @@ Set these environment variables for the bridge. Those marked "both" must also be
 |---|---|---|---|
 | `WHATSAPP_MCP_READ_ONLY` | off | both | `1` disables all sending |
 | `WHATSAPP_MCP_ENABLE_SEND_MEDIA` | off | both | `1` enables `send_file` and `send_audio_message` |
-| `WHATSAPP_MCP_SEND_ALLOWLIST` | empty | bridge | Comma-separated phone numbers or JIDs; when set, messages can only be sent to these chats |
+| `WHATSAPP_MCP_SEND_ALLOWLIST` | empty | bridge | Comma-separated phone numbers or JIDs; when set, messages and polls can only be sent to these chats |
 | `WHATSAPP_MCP_MAX_DOWNLOAD_MB` | 100 | bridge | Largest media file that will be downloaded |
 | `WHATSAPP_MCP_PORT` | 8080 | both | Port of the REST API on localhost |
 | `WHATSAPP_MCP_STORE_DIR` | `whatsapp-bridge/store` | both | Where the databases, token and media are kept |
@@ -179,7 +179,10 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
 - **get_unread_messages**: Show what you haven't read yet in a chat, with a few earlier messages for context
+- **list_polls**: List recent polls with how many voted, what leads, and whether you voted
+- **get_poll_results**: Show a poll's results: each option with its count and who chose it
 - **send_message**: Send a WhatsApp message to an existing chat, by phone number or group JID
+- **send_poll**: Send a poll (2 to 12 options, choose one or several) to an existing chat
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient. Only available with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1`
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed). Only available with `WHATSAPP_MCP_ENABLE_SEND_MEDIA=1`
 - **download_media**: Download media from a WhatsApp message and get the local file path
@@ -213,6 +216,14 @@ The bridge records how far you have read each chat on any of your devices, and w
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media into `whatsapp-bridge/store/media/` and then returns the file path which can be then opened or passed to another tool.
+
+### Polls
+
+Polls show up in transcripts with their current vote counts, and Claude can list them, report results and send new ones. Claude can't vote. The same rules as `send_message` apply to `send_poll`: existing chats only, the send allowlist, and nothing is sent in read-only mode.
+
+- **What is counted**: votes cast while the bridge is linked (changed and withdrawn votes are tracked), plus the votes history brings when the bridge is linked. Older polls may show fewer votes than your phone.
+- **Polls from before this feature**: the bridge used to skip polls, so they are not in the database. Re-link the bridge once (the steps are under Read and Unread Chats) to bring in recent polls with their votes.
+- **Limits**: options someone adds after a poll is sent are counted as "an option added after the poll was sent", and edits to a poll are not picked up.
 
 ## Technical Details
 

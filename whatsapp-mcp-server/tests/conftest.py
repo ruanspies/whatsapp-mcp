@@ -1,4 +1,5 @@
 """Fixtures: a throwaway bridge store (messages.db, whatsapp.db, api_token) and a stub bridge HTTP API."""
+import hashlib
 import json
 import os
 import sqlite3
@@ -19,6 +20,7 @@ GROUP = "120363000000000001@g.us"
 ALICE = "27821234567@s.whatsapp.net"
 BOB = "27829999999@s.whatsapp.net"
 LOOKALIKE = "127821234567@s.whatsapp.net"
+CLUB = "120363000000000002@g.us"
 
 SCHEMA = """
 CREATE TABLE chats(jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP,
@@ -26,6 +28,12 @@ CREATE TABLE chats(jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP,
 CREATE TABLE messages(id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, is_from_me BOOLEAN,
     media_type TEXT, filename TEXT, url TEXT, media_key BLOB, file_sha256 BLOB, file_enc_sha256 BLOB,
     file_length INTEGER, direct_path TEXT, mime_type TEXT, PRIMARY KEY (id, chat_jid));
+"""
+POLL_SCHEMA = """
+CREATE TABLE polls(message_id TEXT, chat_jid TEXT, question TEXT, options TEXT,
+    selectable_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (message_id, chat_jid));
+CREATE TABLE poll_votes(poll_id TEXT, chat_jid TEXT, voter TEXT, selected TEXT, voted_at TIMESTAMP,
+    is_from_me BOOLEAN NOT NULL DEFAULT 0, PRIMARY KEY (poll_id, chat_jid, voter));
 """
 
 # (id, chat, sender, content, UTC time, is_from_me, media_type, filename)
@@ -48,6 +56,9 @@ MESSAGES = [
     ("A3", ALICE, "27821234567", "Great. Did you see the budget?", "2026-10-09 07:00:00+00:00", 0, None, None),
     ("B1", BOB, "27829999999", "Call me when you can", "2026-10-09 16:00:00+00:00", 0, None, None),
     ("L1", LOOKALIKE, "127821234567", "Wrong number sorry", "2026-10-07 06:00:00+00:00", 0, None, None),
+    # Polls in a club group, all read
+    ("P1", CLUB, "27821234567", "Braai day?", "2026-10-06 08:00:00+00:00", 0, None, None),
+    ("P2", CLUB, "27820000001", "Bring what?", "2026-10-06 09:00:00+00:00", 1, None, None),
 ]
 
 # (jid, name, last_message_time, last_read_at, marked_unread)
@@ -60,6 +71,27 @@ CHATS = [
     (ALICE, "Alice Chat", "2026-10-09 07:00:00+00:00", "2026-10-08 10:05:00+00:00", 0),
     # Not known yet
     (BOB, "27829999999", "2026-10-09 16:00:00+00:00", None, 0),  # name fell back to the number
+    (CLUB, "Club", "2026-10-06 09:00:00+00:00", "2026-10-06 09:00:00+00:00", 0),
+]
+
+
+def vote_hashes(*options):
+    return json.dumps([hashlib.sha256(option.encode()).hexdigest() for option in options])
+
+# (message_id, chat, question, options, selectable_count)
+POLLS = [
+    ("P1", CLUB, "Braai day?", json.dumps(["Sat", "Sun"]), 1),
+    ("P2", CLUB, "Bring what?", json.dumps(["Salad", "Meat", "Drinks"]), 0),
+]
+
+# (poll_id, chat, voter, selected, voted_at, is_from_me)
+VOTES = [
+    ("P1", CLUB, "27821234567", vote_hashes("Sat"), "2026-10-06 08:10:00+00:00", 0),
+    ("P1", CLUB, "27829999999", vote_hashes("Sun"), "2026-10-06 08:20:00+00:00", 0),
+    ("P1", CLUB, "27820000001", vote_hashes("Sat"), "2026-10-06 08:30:00+00:00", 1),
+    ("P1", CLUB, "99887766@lid", vote_hashes("Mon"), "2026-10-06 08:40:00+00:00", 0),  # an option added later
+    ("P2", CLUB, "27821234567", vote_hashes("Salad", "Meat"), "2026-10-06 09:10:00+00:00", 0),
+    ("P2", CLUB, "27829999999", "[]", "2026-10-06 09:20:00+00:00", 0),  # withdrawn
 ]
 
 # (their_jid, first_name, full_name, push_name, business_name)
@@ -71,10 +103,14 @@ CONTACTS = [
 ]
 
 
-def build_store(path, with_contacts=True, with_token=True):
+def build_store(path, with_contacts=True, with_token=True, with_polls=True):
     os.makedirs(path, exist_ok=True)
     conn = sqlite3.connect(os.path.join(path, "messages.db"))
     conn.executescript(SCHEMA)
+    if with_polls:
+        conn.executescript(POLL_SCHEMA)
+        conn.executemany("INSERT INTO polls VALUES (?, ?, ?, ?, ?)", POLLS)
+        conn.executemany("INSERT INTO poll_votes VALUES (?, ?, ?, ?, ?, ?)", VOTES)
     conn.executemany("INSERT INTO chats VALUES (?, ?, ?, ?, ?)", CHATS)
     conn.executemany(
         "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename) "
@@ -123,6 +159,9 @@ class StubBridge(BaseHTTPRequestHandler):
             if body.get("recipient") == "27820009999":
                 return self._reply(403, {"success": False, "message": "recipient is not an existing chat"})
             return self._reply(200, {"success": True, "message": f"Message sent to {body.get('recipient')}"})
+        if self.path == "/api/send_poll":
+            return self._reply(200, {"success": True, "message": f"Poll sent to {body.get('recipient')}",
+                                     "message_id": "3EB0POLL"})
         if self.path == "/api/download":
             if body.get("message_id") == "HUGE":
                 return self._reply(413, {"success": False, "message": "media exceeds the download size limit"})
