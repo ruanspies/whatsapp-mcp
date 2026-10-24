@@ -671,64 +671,122 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         return [_chat_dict(row, names) for row in cursor]
 
 
-def get_unread_messages(chat_jid: str, limit: int = 200, context_before: int = 3) -> str:
-    """Get the messages in a chat after the point I last read it, as a transcript."""
-    limit = _clamp(limit, 1, MAX_MESSAGE_LIMIT)
+UNREAD_CHAT_TYPES = ("all", "groups", "direct")
+UNREAD_PER_CHAT = 50
+MAX_UNREAD_CHATS = 50
+
+def get_unread_messages(
+    chat_jid: Optional[str] = None,
+    limit: Optional[int] = None,
+    context_before: int = 3,
+    chat_type: str = "all",
+    max_chats: int = 20,
+) -> str:
+    """Get the messages after the point I last read a chat, as a transcript: of one chat,
+    or of every chat with unread messages when no chat is given."""
     context_before = _clamp(context_before, 0, MAX_CONTEXT)
-    chat_jid = chat_jid.strip()
+    if chat_type not in UNREAD_CHAT_TYPES:
+        raise WhatsAppError(f"Invalid chat_type: {chat_type!r}. Use 'all', 'groups' or 'direct'.")
 
     with _messages_db() as conn:
         names = _Names(conn)
-        chat = conn.execute(
-            f"SELECT {_chat_columns(conn)} FROM chats c {NO_MESSAGE_JOIN} WHERE c.jid = ?", (chat_jid,)
-        ).fetchone()
-        if not chat:
-            raise WhatsAppError(f"Chat {chat_jid} not found.")
+        if chat_jid and chat_jid.strip():
+            chat_jid = chat_jid.strip()
+            chat = conn.execute(
+                f"SELECT {_chat_columns(conn)} FROM chats c {NO_MESSAGE_JOIN} WHERE c.jid = ?", (chat_jid,)
+            ).fetchone()
+            if not chat:
+                raise WhatsAppError(f"Chat {chat_jid} not found.")
+            if not _has_read_state(conn):
+                raise WhatsAppError(NO_READ_STATE)
+            name = names.chat(chat_jid, chat["name"])
+            if chat["last_read_at"] is None:
+                raise WhatsAppError(
+                    f"It is not known yet what has been read in {name}. It becomes known when the chat is next "
+                    "read on the phone or replied to. Use list_messages with chat_jid and after instead."
+                )
+            per_chat = _clamp(200 if limit is None else limit, 1, MAX_MESSAGE_LIMIT)
+            return _unread_section(conn, names, chat, per_chat, context_before)
+
+        # Every chat with unread messages, most recently active first
         if not _has_read_state(conn):
             raise WhatsAppError(NO_READ_STATE)
-        name = names.chat(chat_jid, chat["name"])
-        if chat["last_read_at"] is None:
-            raise WhatsAppError(
-                f"It is not known yet what has been read in {name}. It becomes known when the chat is next "
-                "read on the phone or replied to. Use list_messages with chat_jid and after instead."
-            )
-        read_until = _local_iso(chat["last_read_at"])
+        max_chats = _clamp(max_chats, 1, MAX_UNREAD_CHATS)
+        per_chat = _clamp(UNREAD_PER_CHAT if limit is None else limit, 1, MAX_MESSAGE_LIMIT)
+        where = "(unread_count > 0 OR c.marked_unread)"
+        if chat_type == "groups":
+            where += " AND c.jid LIKE '%@g.us'"
+        elif chat_type == "direct":
+            where += " AND c.jid NOT LIKE '%@g.us'"
+        chats = conn.execute(
+            f"SELECT {_chat_columns(conn)} FROM chats c {NO_MESSAGE_JOIN} WHERE {where} "
+            "ORDER BY c.last_message_time DESC, c.jid"
+        ).fetchall()
+        kind = {"all": "chats", "groups": "group chats", "direct": "direct chats"}[chat_type]
+        if not chats:
+            return f"No unread messages in any {kind[:-1]}."
+        total = len(chats)
+        chats = chats[:max_chats]
+        header = (
+            f"Unread messages in {total} {kind}, most recently active first. "
+            "Each chat starts with a \"## \" line; unread lines start with \"> \" and lines before them are "
+            "earlier context."
+        )
+        if total > max_chats:
+            header += (f" Only the first {max_chats} are shown; raise max_chats (up to {MAX_UNREAD_CHATS}) "
+                       "or pass chat_jid for the rest.")
+        sections = [
+            f"## {names.chat(chat['jid'], chat['name'])} ({chat['jid']})\n"
+            + _unread_section(conn, names, chat, per_chat, context_before)
+            for chat in chats
+        ]
+        return header + "\n\n" + "\n\n".join(sections)
 
-        order = _chat_positions(conn, chat_jid)
-        unread = [r[0] for r in conn.execute(
-            "SELECT rowid FROM messages WHERE chat_jid = ? AND timestamp > ? ORDER BY timestamp ASC, rowid ASC",
-            (chat_jid, chat["last_read_at"]),
-        )]
-        index = {rowid: i for i, rowid in enumerate(order)}
 
-        if not unread:
-            if not chat["marked_unread"]:
-                return f"No unread messages in {name} (read up to {read_until})."
-            # Marked unread by hand with nothing new: show where the conversation stands
-            positions = list(range(max(0, len(order) - max(context_before, 5)), len(order)))
-            header = f"{name} is marked as unread, but has no new messages since {read_until}. The latest messages:"
-            marked = set()
-        else:
-            shown = unread[-limit:]
-            first = index[shown[0]]
-            # Context only helps when the unread part is shown from its start
-            start = first - context_before if len(shown) == len(unread) else first
-            positions = list(range(max(0, start), len(order)))
-            header = (
-                f"{chat['unread_count']} unread message(s) from others in {name} since {read_until}"
-                + (" (also marked as unread)" if chat["marked_unread"] else "")
-                + ". Unread lines start with \"> \"; lines before them are earlier context."
-            )
-            if len(shown) < len(unread):
-                header += f" Showing the newest {len(shown)} of {len(unread)} messages after that point."
-            marked = None
+def _unread_section(conn: sqlite3.Connection, names: "_Names", chat: sqlite3.Row, limit: int, context_before: int) -> str:
+    """The unread part of one chat whose read point is known, with a line saying how much is unread."""
+    chat_jid = chat["jid"]
+    name = names.chat(chat_jid, chat["name"])
+    if chat["last_read_at"] is None:
+        return (f"{name} is marked as unread, but it is not known yet what was read in it. "
+                "Use list_messages with chat_jid and after to see it.")
+    read_until = _local_iso(chat["last_read_at"])
 
-        rows = _fetch_rows(conn, [order[i] for i in positions])
-        entries = [(i, rows[order[i]]) for i in positions if order[i] in rows]
-        if marked is None:
-            unread_set = set(unread)
-            marked = {(row["id"], row["chat_jid"]) for i, row in entries if order[i] in unread_set}
-        return header + "\n" + _format_transcript(names, [(chat_jid, entries)], marked)
+    order = _chat_positions(conn, chat_jid)
+    unread = [r[0] for r in conn.execute(
+        "SELECT rowid FROM messages WHERE chat_jid = ? AND timestamp > ? ORDER BY timestamp ASC, rowid ASC",
+        (chat_jid, chat["last_read_at"]),
+    )]
+    index = {rowid: i for i, rowid in enumerate(order)}
+
+    if not unread:
+        if not chat["marked_unread"]:
+            return f"No unread messages in {name} (read up to {read_until})."
+        # Marked unread by hand with nothing new: show where the conversation stands
+        positions = list(range(max(0, len(order) - max(context_before, 5)), len(order)))
+        header = f"{name} is marked as unread, but has no new messages since {read_until}. The latest messages:"
+        marked = set()
+    else:
+        shown = unread[-limit:]
+        first = index[shown[0]]
+        # Context only helps when the unread part is shown from its start
+        start = first - context_before if len(shown) == len(unread) else first
+        positions = list(range(max(0, start), len(order)))
+        header = (
+            f"{chat['unread_count']} unread message(s) from others in {name} since {read_until}"
+            + (" (also marked as unread)" if chat["marked_unread"] else "")
+            + ". Unread lines start with \"> \"; lines before them are earlier context."
+        )
+        if len(shown) < len(unread):
+            header += f" Showing the newest {len(shown)} of {len(unread)} messages after that point."
+        marked = None
+
+    rows = _fetch_rows(conn, [order[i] for i in positions])
+    entries = [(i, rows[order[i]]) for i in positions if order[i] in rows]
+    if marked is None:
+        unread_set = set(unread)
+        marked = {(row["id"], row["chat_jid"]) for i, row in entries if order[i] in unread_set}
+    return header + "\n" + _format_transcript(names, [(chat_jid, entries)], marked)
 
 
 # ---------------------------------------------------------------------------

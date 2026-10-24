@@ -128,7 +128,7 @@ def list_chats(
     others since the chat was last read on any device (null when not known yet),
     "marked_unread" is true when the owner marked the chat as unread, and "last_read_time" is
     the point up to which it was read. Reading messages through these tools never marks
-    anything as read.
+    anything as read. To read what is unread, call get_unread_messages without chat_jid.
 
     Args:
         query: Optional search term to filter chats by name or JID
@@ -209,21 +209,31 @@ def get_message_context(
     return whatsapp_get_message_context(message_id, chat_jid, before, after)
 
 @mcp.tool(structured_output=False)  # plain text: don't send the transcript twice
-def get_unread_messages(chat_jid: str, limit: int = 200, context_before: int = 3) -> str:
-    """Get what the owner has not read yet in a chat, in the list_messages transcript format.
+def get_unread_messages(
+    chat_jid: Optional[str] = None,
+    limit: Optional[int] = None,
+    context_before: int = 3,
+    chat_type: str = "all",
+    max_chats: int = 20,
+) -> str:
+    """Get what the owner has not read yet, in the list_messages transcript format.
 
-    Use it to summarise what was missed: find chats with list_chats(unread_only=True), then
-    call this for each. Unread lines start with "> "; the lines before them are earlier
-    context. The first line says how many are unread and since when. Errors when it is not
-    known yet what was read in the chat; use list_messages with after instead. Reading never
-    marks anything as read on the phone.
+    This is the tool for catching up. Leave out chat_jid to get every chat with unread
+    messages (or marked as unread) in one call, most recently active first, each under a
+    "## <chat name> (<jid>)" line; there is no need to call list_chats first. Pass chat_jid
+    for one chat. Unread lines start with "> "; the lines before them are earlier context.
+    Each chat's first line says how many are unread and since when. For a single chat, it
+    errors when it is not known yet what was read there; use list_messages with after
+    instead. Reading never marks anything as read on the phone.
 
     Args:
-        chat_jid: The JID of the chat
-        limit: Maximum number of unread messages to show, newest kept (default 200, maximum 500)
+        chat_jid: The JID of one chat (optional; leave out for every chat with unread messages)
+        limit: Maximum number of unread messages per chat, newest kept (default 200 for one chat, 50 per chat otherwise; maximum 500)
         context_before: Number of already read messages to show before the first unread one (default 3)
+        chat_type: Without chat_jid, which chats to cover: "all", "groups" or "direct" (default "all")
+        max_chats: Without chat_jid, the most chats to cover (default 20, maximum 50)
     """
-    return whatsapp_get_unread_messages(chat_jid, limit, context_before)
+    return whatsapp_get_unread_messages(chat_jid, limit, context_before, chat_type, max_chats)
 
 @mcp.tool()
 def list_polls(chat_jid: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:

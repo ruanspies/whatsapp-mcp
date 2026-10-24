@@ -239,6 +239,26 @@ def test_unread_messages(store):
     assert "not found" in error("get_unread_messages", chat_jid="nobody@g.us")
 
 
+def test_unread_messages_in_every_chat(store):
+    transcript = call("get_unread_messages", context_before=0)
+    assert transcript.startswith("Unread messages in 3 chats, most recently active first.")
+    headings = [line for line in transcript.splitlines() if line.startswith("## ")]
+    assert headings == [f"## Family ({GROUP})", f"## Alice Smith ({ALICE})", headings[2]]
+    assert LOOKALIKE in headings[2] and "marked as unread, but has no new messages" in transcript
+    assert BOB not in transcript  # read state not known
+    assert ids(transcript) == ["G6", "DUP1", "G8", "G9", "A3", "L1"]
+
+    groups = call("get_unread_messages", chat_type="groups")
+    assert [line for line in groups.splitlines() if line.startswith("## ")] == [f"## Family ({GROUP})"]
+    direct = call("get_unread_messages", chat_type="direct")
+    assert GROUP not in direct and ALICE in direct
+
+    first = call("get_unread_messages", max_chats=1)
+    assert "Unread messages in 3 chats" in first and "Only the first 1 are shown" in first and first.count("\n## ") == 1
+    assert ids(call("get_unread_messages", limit=1, context_before=0))[:1] == ["G9"]
+    assert "Invalid chat_type" in error("get_unread_messages", chat_type="work")
+
+
 def test_unread_messages_with_nothing_unread(store):
     with sqlite3.connect(os.path.join(os.environ["WHATSAPP_MCP_STORE_DIR"], "messages.db")) as conn:
         conn.execute("UPDATE chats SET last_read_at = '2026-10-10 00:00:00+00:00' WHERE jid = ?", (GROUP,))

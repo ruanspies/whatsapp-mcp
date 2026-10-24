@@ -126,7 +126,7 @@ Without this you'll see `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 re
 | `search_contacts` | Find people by name or number |
 | `list_chats` | Your chats, with unread counts. `unread_only=True` lists just the ones that need you |
 | `get_chat` · `get_direct_chat_by_contact` · `get_contact_chats` | Look up a chat, someone's direct chat, or every chat a person is in |
-| `get_unread_messages` | Everything you haven't read in a chat, plus a few earlier lines for context |
+| `get_unread_messages` | Everything you haven't read, plus a few earlier lines for context: one chat, or every unread chat at once (`chat_type="groups"` for just groups) |
 
 **Polls** 📊
 
